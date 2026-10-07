@@ -296,7 +296,9 @@ impl<'b> Blaster<'b> {
         let not_b: Vec<i32> = bext.iter().map(|&l| -l).collect();
         let mut quot = vec![self.f(); w];
         for i in (0..w).rev() {
-            // rem = (rem << 1) | a[i]
+            // Fold the next dividend bit in. Bits are little-endian, so the incoming bit is
+            // *less* significant than everything already in `rem`: it goes to index 0 and the
+            // rest slides up one — which is `rem << 1 | a[i]` read the other way round.
             let mut shifted = Vec::with_capacity(w + 1);
             shifted.push(a[i]);
             shifted.extend_from_slice(&rem[0..w]);
@@ -447,9 +449,13 @@ impl<'b> Blaster<'b> {
         cur
     }
 
-    /// Assert a 1-bit value is true.
+    /// Require a 1-bit value to be true, as a unit clause on its single literal.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bv` is not 1 bit wide.
     pub fn assert_true(&mut self, bv: &Bv) {
-        debug_assert_eq!(bv.width(), 1);
+        assert_eq!(bv.width(), 1, "a constraint must be 1 bit, got {}", bv.width());
         let bits = self.encode(bv);
         self.cnf.add_clause(&[bits[0]]);
     }

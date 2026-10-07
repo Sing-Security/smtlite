@@ -2,11 +2,11 @@
 #
 # No external solver, no C, no `unsafe`: a bitvector expression DAG is bit-blasted to CNF and
 # handed to a self-contained DPLL SAT core, and a satisfying assignment is read back as concrete
-# bitvector values. Scoped to the DIRECTED, single-function queries a symbolic executor asks —
-# not a general-purpose Z3 — so it stays small and dependency-free.
+# bitvector values. Scoped to the DIRECTED, single-function queries a caller asks in bulk —
+# not general-purpose theorem proving — so it stays small and dependency-free.
 #
-# This manifest is deliberately self-contained (no `{ workspace = true }` fields): the crate is
-# published from the suite workspace but must build and publish identically on its own.
+# This manifest is deliberately self-contained (no `{ workspace = true }` fields), so the crate
+# builds and publishes identically whether it is pulled in as a dependency or checked out alone.
 [package]
 name = "smtlite"
 version = "0.1.0"
@@ -30,6 +30,10 @@ exclude = ["**/*.rs.bk"]
 bumpalo = { version = "3", features = ["collections"] }
 
 [lints.rust]
-# No `unsafe` anywhere in this crate. Stated here rather than inherited so the guarantee travels
-# with the crate when it is consumed standalone.
+# Declared here rather than in a `#![...]` attribute so the same settings apply when this
+# manifest is the crate root on its own, with no enclosing workspace to inherit from.
+#
+# No `unsafe` anywhere in this crate.
 unsafe_code = "forbid"
+# Every public item carries a doc comment.
+missing_docs = "warn"

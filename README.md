@@ -24,7 +24,7 @@ match s.check() {
 
 ## What it does
 
-- Bitvector variables of any width, plus constants.
+- Bitvector variables of any width from 1 to 64 bits, plus constants.
 - Boolean: `and`, `or`, `xor`, `not`, `land` (logical and of two 1-bit values).
 - Arithmetic: `add`, `sub`, `mul`, `neg` — all wraparound, as bitvectors are.
 - Division and remainder: unsigned `udiv`/`urem` and signed `sdiv`/`srem`, with the SMT-LIB
@@ -40,10 +40,12 @@ match s.check() {
   1-bit value you can feed into other operations.
 - Width: `zext`, `sext`, `extract(hi, lo)`, `concat`.
 - `ite(cond, then, else)`.
-- A model back out: `Model::get(name)` returns the concrete `u64` a variable took.
+- A model back out: `Model::get(name)` returns the concrete `u64` a variable took, or `None` if
+  no variable by that name was ever declared.
 
-`Solver::depends_on(&bv, "mem")` answers a question a symbolic executor asks constantly — did this
-value actually derive from the loaded field, or is it still an untouched initial register?
+`Solver::depends_on(&bv, "mem")` answers a question a caller asks constantly — did this value
+actually derive from the data read out of the input, or is it still something the caller started
+with? Name variables by origin (`mem…`, `init_…`) and the prefix tells you which.
 
 ## What it deliberately does not do
 
@@ -52,7 +54,10 @@ value actually derive from the loaded field, or is it still an untouched initial
   what compiled code actually emits.
 - **Overflow-detection builtins** (`bvuaddo`, `bvsaddo`, …). Derive them from the primitives:
   `x.add(&y).ult(&x)` is the unsigned-add overflow test.
-- **Widths above 64 bits** — a model is read back as a `u64`.
+- **Widths above 64 bits** — a model is read back as a `u64`, so 64 is the ceiling. It is
+  *enforced*, not merely documented: building a value wider than that, or combining two of
+  different widths, panics rather than quietly blasting the wrong bits. Every method whose
+  inputs have to satisfy something says so under `# Panics`.
 - **An SMT-LIB front-end.** The name invites the assumption; the API is Rust only, there is no
   textual parser and no solver-on-a-pipe protocol.
 
@@ -111,6 +116,12 @@ A solver embedded in a batch job must never hang it. Three guards, all of which 
 
 `Solution::Unknown` is never a silent "unsat" — the three outcomes stay distinct so a caller can
 tell a refutation from a timeout.
+
+## Requirements
+
+- Rust **1.85** or newer (the 2024 edition).
+- No Cargo features — the crate has a single dependency and no optional parts.
+- No `unsafe` (`unsafe_code = "forbid"`) and no build script.
 
 ## Licence
 

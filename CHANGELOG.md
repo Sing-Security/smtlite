@@ -7,14 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] - 2026-10-07
 
-First public release. Extracted from the LogicBomb RE suite's symbolic executor, where it answers
-the directed, single-function queries that turn a static candidate into a confirmed finding — or an
-`Unsat` that kills it.
+First public release. Written for directed, single-function queries — "is there an input that
+makes this overflow?", "can this length reach that copy?" — asked many times over.
 
 ### Added
 
 - **`Solver`** — named bitvector variables (`var`), stored constraints (`assert`), and an
-  explicit-constraint path (`check_all`) for an executor carrying per-path constraints against one
+  explicit-constraint path (`check_all`) for a caller carrying per-path constraints against one
   shared variable namespace.
 - **`Bv`** — bitvector expression combinators:
   - boolean `and`/`or`/`xor`/`not`/`land`;
@@ -39,8 +38,9 @@ the directed, single-function queries that turn a static candidate into a confir
 - **Bounded solving** — a decision budget, an optional wall-clock deadline (`check_all_within`),
   and a formula-size cap (`Solver::with_max_clauses`). All three degrade to `Solution::Unknown`
   rather than stalling the caller.
-- **`Solver::depends_on`** — does a value derive from a variable matching a name prefix (a loaded
-  field) or is it an untouched register?
+- **`Solver::depends_on`** — does a value derive from any variable whose name starts with a
+  given prefix? Name variables by where their data came from and this tells you which of those
+  origins a subexpression actually depends on, without threading provenance by hand.
 - Arena-allocated CNF clauses via `bumpalo` — the crate's only dependency.
 - No `unsafe` (`unsafe_code = "forbid"`), no C, no external solver.
 - A conformance suite (`tests/ops.rs`) that checks every operation against Rust's native operators
@@ -49,6 +49,13 @@ the directed, single-function queries that turn a static candidate into a confir
 
 ### Notes
 
+- **Widths are 1..=64, and the boundary is enforced.** A formula that would cross it — a
+  variable or constant wider than 64, a concatenation past 64, operands of different widths
+  — panics rather than producing a wrong answer. Release builds included: a silently
+  mis-blasted formula is worse than a stopped caller. Every affected method documents this
+  under `# Panics`.
+- **A model reads back through `u64`.** `Model::get` returns the concrete value of a named
+  variable, or `None` if no such variable was declared.
 - `Bv` is an `Rc`-shared node, so `Bv` and `Solver` are neither `Send` nor `Sync` — solving is
   single-threaded by design.
 - Bit-blasting cost varies sharply by operation: bitwise/constant-shift/constant-rotate are linear,

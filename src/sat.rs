@@ -1,11 +1,11 @@
 //! A small, self-contained SAT core: iterative DPLL with unit propagation, chronological
 //! backtracking (branch-and-flip), and a step budget so a hard query degrades to `Unknown`
-//! rather than hanging the IDE.
+//! rather than running without a bound.
 //!
 //! Literals are `i32`: `+(v+1)` for the positive polarity of variable `v`, `-(v+1)` for the
 //! negative. Variable 0 is literal `1` / `-1`. Correctness is the priority here over raw
-//! speed — the formulas the bit-blaster produces for one directed, single-function query are
-//! small (hundreds to a few thousand clauses), and this solves those reliably.
+//! speed — the formulas the bit-blaster produces for a directed query are small (hundreds to
+//! a few thousand clauses), and this solves those reliably.
 //!
 //! Deliberately absent: pure-literal elimination, watched literals, clause learning and
 //! non-chronological backjumping. The clause set is re-scanned to a fixpoint on every
@@ -17,8 +17,12 @@
 /// of tiny same-lifetime clauses, so arena-allocating them turns per-clause `malloc` into a pointer
 /// bump and frees the whole formula at once when the arena drops.
 pub struct Cnf<'b> {
+    /// How many variables have been introduced. Variables are 0-based, so the literals range
+    /// over ±1..=±`nvars`.
     pub nvars: usize,
+    /// The conjunction, one clause per element, each borrowed from the arena.
     pub clauses: Vec<&'b [i32]>,
+    /// The arena the clauses live in; kept so clauses can be allocated as they are added.
     bump: &'b bumpalo::Bump,
 }
 
@@ -34,17 +38,26 @@ pub enum SatResult {
 }
 
 impl<'b> Cnf<'b> {
+    /// An empty formula over zero variables, whose clauses will be allocated in `bump`.
     #[must_use]
     pub fn new(bump: &'b bumpalo::Bump) -> Self {
         Self { nvars: 0, clauses: Vec::new(), bump }
     }
 
     /// Allocate a fresh variable, returning its positive literal.
+    ///
+    /// Never reuses an id, and never unassigns one, so literals stay valid for the formula's
+    /// whole lifetime — which is what lets the blaster hand them around freely.
     pub fn new_var(&mut self) -> i32 {
         self.nvars += 1;
         self.nvars as i32 // literal for var (nvars-1) is +nvars
     }
 
+    /// Add a clause: the disjunction of `lits`.
+    ///
+    /// The literals are copied into the arena, so the slice need not outlive the call. An
+    /// empty clause is the empty disjunction — immediately false, and therefore the way to
+    /// state "unsatisfiable" outright.
     pub fn add_clause(&mut self, lits: &[i32]) {
         self.clauses.push(self.bump.alloc_slice_copy(lits));
     }

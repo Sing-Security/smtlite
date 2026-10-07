@@ -1,21 +1,49 @@
-//! smtlite — a small, pure-Rust QF_BV SMT solver for the RE suite's symbolic executor.
+//! smtlite — a small, pure-Rust QF_BV SMT solver.
 //!
-//! Build bitvector expressions with [`Solver::var`] and the [`Bv`] combinators, assert 1-bit
-//! constraints, and [`Solver::check`]. Under the hood the expression DAG is bit-blasted to
-//! CNF (`blast`) and solved by a self-contained DPLL core (`sat`); a satisfying
-//! assignment is read back as concrete values — the PoC seeds the executor needs to turn a
-//! static *candidate* into a *confirmed* finding, or an `Unsat` that kills it.
+//! Quantifier-free bitvector formulas only: build expressions with [`Solver::var`] and the
+//! [`Bv`] combinators, [`Solver::assert`] the 1-bit constraints, and call [`Solver::check`].
+//! A **satisfying** answer comes back as a [`Model`] you can read concrete values out of; the
+//! alternative answers are `Unsat` and a budget-limited `Unknown`, and the three are kept
+//! distinct so a caller can tell a proof from a timeout ([`Solution`]).
+//!
+//! It is scoped to *directed* queries — "is there an input that makes this operation
+//! overflow?", "can this length reach that copy?" — asked many times over, rather than to
+//! general theorem proving. See the README for what that costs and what it rules out.
+//!
+//! Under the hood the expression DAG is bit-blasted to CNF and solved by a self-contained
+//! DPLL core. There is no external solver, no C, and no `unsafe`; `bumpalo` is the only
+//! dependency, and it is an allocator.
 //!
 //! ```
-//! use smtlite::{Solver, Bv, Solution};
+//! use smtlite::{Bv, Solution, Solver};
+//!
 //! let mut s = Solver::new();
 //! let x = s.var("x", 64);
 //! s.assert(x.add(&Bv::val(3, 64)).eq(&Bv::val(10, 64))); // x + 3 == 10
+//!
 //! match s.check() {
 //!     Solution::Sat(m) => assert_eq!(m.get("x"), Some(7)),
 //!     other => panic!("expected SAT, got {other:?}"),
 //! }
 //! ```
+//!
+//! # Bounded by construction
+//!
+//! A solve can always be told when to give up rather than be allowed to run away:
+//! [`Solver::check_with_budget`] caps decisions, [`Solver::check_all_within`] adds a
+//! wall-clock deadline, and [`Solver::with_max_clauses`] caps the formula size. Any of them
+//! being hit yields [`Solution::Unknown`], never a wrong verdict.
+//!
+//! # Width and threading limits
+//!
+//! Widths are 1..=64 bits, because [`Model::get`] reads a variable back as a `u64`. Nothing
+//! silently wraps around that: an operation whose result or target width would fall outside
+//! 1..=64 **panics**, as does one given two operands of different widths. A malformed formula
+//! is a bug in the caller, and a panic is better than a quietly wrong verdict. Each such
+//! method says so under `# Panics`.
+//!
+//! A [`Bv`] is an `Rc`-shared node, so neither [`Bv`] nor [`Solver`] is `Send` or `Sync` — one
+//! solve runs on one thread.
 
 mod blast;
 mod bv;
@@ -24,7 +52,6 @@ mod sat;
 use std::collections::HashMap;
 
 pub use bv::{Bv, mask};
-pub use sat::SatResult;
 
 use blast::Blaster;
 use bv::Node;
@@ -42,11 +69,25 @@ const DEFAULT_BUDGET: u64 = 4_000_000;
 /// needs one raises the cap deliberately via [`Solver::with_max_clauses`].
 const DEFAULT_MAX_CLAUSES: usize = 40_000;
 
-/// A satisfiability result with a readable model on success.
+/// The answer to a satisfiability query, three-valued.
+///
+/// The distinction that matters is [`Unknown`](Solution::Unknown) against the other two: `Sat`
+/// and `Unsat` are verdicts about the formula, while `Unknown` says only that a configured
+/// bound was reached first. Nothing may treat `Unknown` as "no solution exists" — it is the
+/// absence of an answer, not a negative one.
 #[derive(Debug)]
 pub enum Solution {
+    /// Satisfiable. The [`Model`] holds a concrete assignment under which every asserted
+    /// constraint holds simultaneously.
     Sat(Model),
+    /// Unsatisfiable — no assignment satisfies the constraints, proven within the bounds.
     Unsat,
+    /// No verdict: the decision budget, the wall-clock deadline, or the clause cap was reached
+    /// before the search finished.
+    ///
+    /// There is no partial model to salvage. Raise the bound that was hit
+    /// ([`Solver::check_with_budget`], [`Solver::check_all_within`],
+    /// [`Solver::with_max_clauses`]) and ask again, or treat the query as unresolved.
     Unknown,
 }
 
@@ -65,6 +106,15 @@ impl Default for Solver {
 }
 
 impl Solver {
+    /// An empty solver: no variables, no constraints.
+    ///
+    /// ```
+    /// use smtlite::Solver;
+    ///
+    /// let mut s = Solver::new();
+    /// let x = s.var("x", 32);
+    /// assert_eq!(x.width(), 32);
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -81,27 +131,82 @@ impl Solver {
     }
 
     /// A fresh `width`-bit symbolic variable.
+    ///
+    /// The name is a label for [`Model::get`] readback and
+    /// [`depends_on`](Self::depends_on) prefix matching, not an identity: reusing a name
+    /// creates an independent variable that merely reads back under the same key.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `width` is 1..=64. A model is read back through a `u64`, so every width
+    /// in the crate is bounded by that; a wider variable would be unreadable and could not
+    /// hold a constant.
     pub fn var(&mut self, name: &str, width: u32) -> Bv {
+        assert!((1..=64).contains(&width), "variable width must be 1..=64, got {width}");
         let id = self.vars.len();
         self.vars.push((name.to_string(), width));
         Bv::wrap(Node::Var(width, id))
     }
 
-    /// Does `bv` reference any variable whose name starts with `prefix`? Lets a caller tell a
-    /// value derived from a loaded field (`mem…`) apart from one that is only an untouched
-    /// initial register (`init_…`).
+    /// Does `bv` reference any variable whose name starts with `prefix`?
+    ///
+    /// This is how a caller tells where a value came from without threading provenance
+    /// through every operation: name the variables by origin — one prefix for data read from
+    /// outside, another for values the caller started with — and ask which of them a
+    /// subexpression actually depends on. Use [`ptr_eq`](Bv::ptr_eq) to ask whether two
+    /// handles are the *same* value.
+    ///
+    /// ```
+    /// use smtlite::{Bv, Solver};
+    ///
+    /// let mut s = Solver::new();
+    /// let len = s.var("hdr.len", 16);
+    /// let base = s.var("init.base", 16);
+    ///
+    /// assert!(s.depends_on(&len.add(&Bv::val(1, 16)), "hdr."));
+    /// assert!(!s.depends_on(&base, "hdr."));
+    /// ```
     #[must_use]
     pub fn depends_on(&self, bv: &Bv, prefix: &str) -> bool {
         bv.var_ids().into_iter().any(|id| self.vars.get(id).is_some_and(|(n, _)| n.starts_with(prefix)))
     }
 
-    /// Assert a 1-bit constraint must hold.
+    /// Assert that a 1-bit constraint must hold.
+    ///
+    /// Constraints accumulate; the next solve has to satisfy all of them at once. A
+    /// contradiction between two of them is a legitimate way to get [`Solution::Unsat`], not
+    /// an error.
+    ///
+    /// ```
+    /// use smtlite::{Bv, Solution, Solver};
+    ///
+    /// let mut s = Solver::new();
+    /// let x = s.var("x", 8);
+    /// s.assert(x.eq(&Bv::val(0, 8)));
+    /// s.assert(x.eq(&Bv::val(1, 8))); // contradicts the line above
+    /// assert!(matches!(s.check(), Solution::Unsat));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `constraint` is not 1 bit wide. A multi-bit value is not a proposition;
+    /// blasting one bit of it would answer a question the caller did not ask.
     pub fn assert(&mut self, constraint: Bv) {
-        debug_assert_eq!(constraint.width(), 1, "assert expects a 1-bit (boolean) value");
+        assert_eq!(constraint.width(), 1, "a constraint must be 1 bit, got {}", constraint.width());
         self.asserts.push(constraint);
     }
 
-    /// Solve with the default budget.
+    /// Solve the accumulated constraints with the default budget.
+    ///
+    /// ```
+    /// use smtlite::{Bv, Solution, Solver};
+    ///
+    /// let mut s = Solver::new();
+    /// let n = s.var("n", 8);
+    /// s.assert(n.mul(&Bv::val(4, 8)).ult(&n)); // n*4 wrapped: an overflow exists
+    ///
+    /// assert!(matches!(s.check(), Solution::Sat(_)));
+    /// ```
     #[must_use]
     pub fn check(&self) -> Solution {
         self.check_with_budget(DEFAULT_BUDGET)
@@ -113,24 +218,35 @@ impl Solver {
         self.solve_constraints(&self.asserts, budget, None)
     }
 
-    /// Check an explicit set of constraints WITHOUT storing them — for a symbolic executor
-    /// that carries per-path constraints and asks many independent questions against one
-    /// shared variable namespace.
+    /// Solve an explicit set of constraints *without* storing them, against the variables
+    /// already declared.
+    ///
+    /// The constraints passed here are the whole formula: nothing previously
+    /// [`assert`](Self::assert)ed takes part. That makes this the entry point for asking many
+    /// independent questions against one shared variable namespace — where each question
+    /// carries its own set of constraints (one path's assumptions, say) and none of them
+    /// should leak into the next.
     #[must_use]
     pub fn check_all(&self, constraints: &[Bv]) -> Solution {
         self.solve_constraints(constraints, DEFAULT_BUDGET, None)
     }
 
-    /// [`check_all`](Self::check_all) with an explicit decision budget — a caller running many
-    /// queries under a wall-clock deadline (e.g. a corpus sweep) uses a small budget so a single
-    /// hard instance degrades to [`Solution::Unknown`] fast instead of stalling the batch.
+    /// [`check_all`](Self::check_all) with an explicit decision budget.
+    ///
+    /// A caller running many queries (a sweep over a corpus, say) uses a small budget so one
+    /// hard instance degrades to [`Solution::Unknown`] quickly instead of dominating the
+    /// batch's wall-clock.
     #[must_use]
     pub fn check_all_with_budget(&self, constraints: &[Bv], budget: u64) -> Solution {
         self.solve_constraints(constraints, budget, None)
     }
 
-    /// [`check_all_with_budget`](Self::check_all_with_budget) plus a wall-clock `deadline` — the
-    /// hard bound a corpus sweep needs so one propagation-heavy query can't stall the batch.
+    /// [`check_all_with_budget`](Self::check_all_with_budget) plus a wall-clock `deadline`.
+    ///
+    /// The decision budget alone bounds decisions, not time — one propagation-heavy formula
+    /// can burn seconds between decisions — so a batch that must finish inside a wall-clock
+    /// bound passes a real deadline here and lets the slowest query degrade instead of
+    /// stalling everything behind it.
     #[must_use]
     pub fn check_all_within(&self, constraints: &[Bv], budget: u64, deadline: std::time::Instant) -> Solution {
         self.solve_constraints(constraints, budget, Some(deadline))
@@ -159,6 +275,10 @@ impl Solver {
 }
 
 /// A satisfying assignment, queryable by variable name.
+///
+/// Only [`Solution::Sat`] carries one. The assignment is total — every variable the solver
+/// knows about has a value here, whether or not a given constraint mentioned it — but
+/// [`get`](Model::get) reports only the variables this model was actually built with.
 #[derive(Debug)]
 pub struct Model {
     assignment: Vec<bool>,
@@ -167,11 +287,35 @@ pub struct Model {
 }
 
 impl Model {
-    /// The concrete value of a variable, or `None` if it never appeared in a constraint.
+    /// The concrete value of a variable, or `None` if the model has no such variable.
+    ///
+    /// `None` means the name was never declared on the [`Solver`] that produced this model —
+    /// not that the value is unknown. A declared variable always reads back, including one no
+    /// constraint mentioned (the solver still assigns it a value).
+    ///
+    /// ```
+    /// use smtlite::{Bv, Solution, Solver};
+    ///
+    /// let mut s = Solver::new();
+    /// let x = s.var("x", 64);
+    /// s.assert(x.and(&Bv::val(0xf, 64)).eq(&Bv::val(0xc, 64)));
+    ///
+    /// let Solution::Sat(m) = s.check() else { unreachable!() };
+    /// assert_eq!(m.get("x").map(|v| v & 0xf), Some(0xc));
+    /// assert_eq!(m.get("never_declared"), None);
+    /// ```
+    ///
+    /// A model reads back as a `u64`, so a value wider than that has no representation and
+    /// reads back as `None`. Widths are capped at 64 throughout ([`Solver::var`]), so this is
+    /// unreachable through the public API; it is checked rather than assumed so the readback
+    /// can never shift a bit off the end of the word.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<u64> {
         let id = *self.name_to_id.get(name)?;
         let bits = self.var_bits.get(&id)?;
+        if bits.len() > 64 {
+            return None;
+        }
         let mut v = 0u64;
         for (i, &lit) in bits.iter().enumerate() {
             let base = self.assignment[(lit.unsigned_abs() - 1) as usize];
@@ -256,8 +400,8 @@ mod tests {
 
     #[test]
     fn test_overflow_in_size_math() {
-        // The classic: count * elem overflows the 32-bit size, so the product is < elem —
-        // exactly the "integer overflow in an allocation size" the executor will ask about.
+        // The classic shape: `count * elem` overflows a 32-bit size, so the product wraps below
+        // `elem` — the "integer overflow in an allocation size" question this crate exists for.
         let mut s = Solver::new();
         let count = s.var("count", 32);
         let elem = Bv::val(0x10, 32);
