@@ -1,0 +1,35 @@
+# smtlite — a small, pure-Rust QF_BV SMT solver.
+#
+# No external solver, no C, no `unsafe`: a bitvector expression DAG is bit-blasted to CNF and
+# handed to a self-contained DPLL SAT core, and a satisfying assignment is read back as concrete
+# bitvector values. Scoped to the DIRECTED, single-function queries a symbolic executor asks —
+# not a general-purpose Z3 — so it stays small and dependency-free.
+#
+# This manifest is deliberately self-contained (no `{ workspace = true }` fields): the crate is
+# published from the suite workspace but must build and publish identically on its own.
+[package]
+name = "smtlite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "A small, pure-Rust QF_BV SMT solver: bitvector expressions bit-blasted to CNF and solved by a self-contained DPLL core."
+readme = "README.md"
+repository = "https://github.com/Sing-Security/smtlite"
+homepage = "https://github.com/Sing-Security/smtlite"
+documentation = "https://docs.rs/smtlite"
+keywords = ["smt", "solver", "bitvector", "sat", "symbolic-execution"]
+categories = ["algorithms", "development-tools"]
+publish = true
+exclude = ["**/*.rs.bk"]
+
+[dependencies]
+# The sole dependency: a bump arena for the bit-blaster's per-solve CNF clauses (thousands of tiny,
+# same-lifetime allocations freed together). Pure Rust, no C — the crate's "no external solver, no C"
+# principle holds; this is an allocator, not a solver.
+bumpalo = { version = "3", features = ["collections"] }
+
+[lints.rust]
+# No `unsafe` anywhere in this crate. Stated here rather than inherited so the guarantee travels
+# with the crate when it is consumed standalone.
+unsafe_code = "forbid"

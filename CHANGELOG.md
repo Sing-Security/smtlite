@@ -1,0 +1,57 @@
+# Changelog
+
+All notable changes to smtlite will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.1.0] - 2026-10-07
+
+First public release. Extracted from the LogicBomb RE suite's symbolic executor, where it answers
+the directed, single-function queries that turn a static candidate into a confirmed finding — or an
+`Unsat` that kills it.
+
+### Added
+
+- **`Solver`** — named bitvector variables (`var`), stored constraints (`assert`), and an
+  explicit-constraint path (`check_all`) for an executor carrying per-path constraints against one
+  shared variable namespace.
+- **`Bv`** — bitvector expression combinators:
+  - boolean `and`/`or`/`xor`/`not`/`land`;
+  - arithmetic `add`/`sub`/`mul`/`neg`, all wraparound;
+  - division and remainder — unsigned `udiv`/`urem`, signed `sdiv`/`srem`, with SMT-LIB
+    zero-divisor semantics (`bvudiv` by zero is all-ones, `bvurem` by zero is the dividend,
+    `bvsdiv` by zero is all-ones for a non-negative dividend and `1` otherwise). `srem` takes the
+    sign of the dividend — C's `%`, not `bvsmod`'s;
+  - shifts `shl`/`lshr`/`ashr` by a constant amount and `shl_var`/`lshr_var`/`ashr_var` by a
+    symbolic one; a shift at or past the width empties the value rather than wrapping;
+  - rotates `rotl`/`rotr` by a constant and `rotl_var`/`rotr_var` by a symbolic amount, where a
+    power-of-two width reduces the amount for free and any other width costs a divider;
+  - comparison `eq`/`ne`/`ult`/`ule`/`ugt`/`uge`/`slt`/`sle`/`sgt`/`sge`;
+  - width `zext`/`sext`/`extract`/`concat`, plus `ite`;
+  - and `val`, `as_const`, `width`, `ptr_eq`.
+- **`Model`** — a satisfying assignment readable by variable name (`get`).
+- **Bit-blaster** — Tseitin-encoded operations, ripple-carry adders, comparison via the carry-out
+  of `a + ¬b + 1`, restoring division, barrel shifters and rotators, memoised shared subgraphs
+  (`Rc` identity), little-endian bits.
+- **SAT core** — iterative DPLL: unit propagation to a fixpoint with chronological branch-and-flip
+  backtracking.
+- **Bounded solving** — a decision budget, an optional wall-clock deadline (`check_all_within`),
+  and a formula-size cap (`Solver::with_max_clauses`). All three degrade to `Solution::Unknown`
+  rather than stalling the caller.
+- **`Solver::depends_on`** — does a value derive from a variable matching a name prefix (a loaded
+  field) or is it an untouched register?
+- Arena-allocated CNF clauses via `bumpalo` — the crate's only dependency.
+- No `unsafe` (`unsafe_code = "forbid"`), no C, no external solver.
+- A conformance suite (`tests/ops.rs`) that checks every operation against Rust's native operators
+  as an oracle: exhaustive at width 4, sampled at 8, edge cases at 32 and 64, with each result
+  proven both satisfiable-equal and unsatisfiable-unequal to the expected constant.
+
+### Notes
+
+- `Bv` is an `Rc`-shared node, so `Bv` and `Solver` are neither `Send` nor `Sync` — solving is
+  single-threaded by design.
+- Bit-blasting cost varies sharply by operation: bitwise/constant-shift/constant-rotate are linear,
+  `mul` and `div` are quadratic in the width, symbolic shifts are `O(w log w)`. A 64-bit division
+  blasts to roughly 110,000 clauses, over the 40,000 default cap.
+- There is no SMT-LIB front-end: the API is Rust only.
