@@ -81,7 +81,9 @@ impl Bv {
             Node::Const(w, _) | Node::Var(w, _) => *w,
             Node::Not(a) | Node::Neg(a) | Node::Bin(_, a, _) => a.width(),
             Node::ShlC(a, _) | Node::ShrC(a, _, _) => a.width(),
-            Node::ShlV(a, _) | Node::ShrV(a, _, _) | Node::RotC(a, _, _) | Node::RotV(a, _, _) => a.width(),
+            Node::ShlV(a, _) | Node::ShrV(a, _, _) | Node::RotC(a, _, _) | Node::RotV(a, _, _) => {
+                a.width()
+            }
             Node::Compare(_, _, _) => 1,
             Node::Zext(_, w) | Node::Sext(_, w) => *w,
             Node::Extract(_, hi, lo) => hi - lo + 1,
@@ -98,7 +100,10 @@ impl Bv {
     /// Panics unless `w` is 1..=64 — see [`Solver::var`](crate::Solver::var).
     #[must_use]
     pub fn val(v: u64, w: u32) -> Bv {
-        assert!((1..=64).contains(&w), "constant width must be 1..=64, got {w}");
+        assert!(
+            (1..=64).contains(&w),
+            "constant width must be 1..=64, got {w}"
+        );
         Bv::wrap(Node::Const(w, mask(v, w)))
     }
 
@@ -109,7 +114,11 @@ impl Bv {
     /// [`ptr_eq`](Bv::ptr_eq) or the solver when the distinction matters.
     #[must_use]
     pub fn as_const(&self) -> Option<u64> {
-        if let Node::Const(_, v) = &*self.0 { Some(*v) } else { None }
+        if let Node::Const(_, v) = &*self.0 {
+            Some(*v)
+        } else {
+            None
+        }
     }
 
     /// Every variable id this expression references, deduplicated.
@@ -132,10 +141,20 @@ impl Bv {
             match &*cur.0 {
                 Node::Const(_, _) => {}
                 Node::Var(_, id) => ids.push(*id),
-                Node::Not(a) | Node::Neg(a) | Node::ShlC(a, _) | Node::ShrC(a, _, _) | Node::RotC(a, _, _)
-                | Node::Zext(a, _) | Node::Sext(a, _) | Node::Extract(a, _, _) => stack.push(a.clone()),
-                Node::Bin(_, a, b) | Node::Compare(_, a, b) | Node::Concat(a, b) | Node::ShlV(a, b)
-                | Node::ShrV(a, b, _) | Node::RotV(a, b, _) => {
+                Node::Not(a)
+                | Node::Neg(a)
+                | Node::ShlC(a, _)
+                | Node::ShrC(a, _, _)
+                | Node::RotC(a, _, _)
+                | Node::Zext(a, _)
+                | Node::Sext(a, _)
+                | Node::Extract(a, _, _) => stack.push(a.clone()),
+                Node::Bin(_, a, b)
+                | Node::Compare(_, a, b)
+                | Node::Concat(a, b)
+                | Node::ShlV(a, b)
+                | Node::ShrV(a, b, _)
+                | Node::RotV(a, b, _) => {
                     stack.push(a.clone());
                     stack.push(b.clone());
                 }
@@ -269,7 +288,13 @@ impl Bv {
     }
 
     fn bin(&self, op: Op, o: &Bv) -> Bv {
-        assert_eq!(self.width(), o.width(), "bitvector op needs equal widths, got {} and {}", self.width(), o.width());
+        assert_eq!(
+            self.width(),
+            o.width(),
+            "bitvector op needs equal widths, got {} and {}",
+            self.width(),
+            o.width()
+        );
         Bv::wrap(Node::Bin(op, self.clone(), o.clone()))
     }
 
@@ -437,7 +462,13 @@ impl Bv {
     }
 
     fn cmp(&self, c: Cmp, o: &Bv) -> Bv {
-        assert_eq!(self.width(), o.width(), "comparison needs equal widths, got {} and {}", self.width(), o.width());
+        assert_eq!(
+            self.width(),
+            o.width(),
+            "comparison needs equal widths, got {} and {}",
+            self.width(),
+            o.width()
+        );
         Bv::wrap(Node::Compare(c, self.clone(), o.clone()))
     }
 
@@ -449,7 +480,11 @@ impl Bv {
     /// [`extract`](Bv::extract)'s job, and 64 is the ceiling a model can read back.
     #[must_use]
     pub fn zext(&self, new_w: u32) -> Bv {
-        assert!(new_w >= self.width(), "zext must widen: {} to {new_w}", self.width());
+        assert!(
+            new_w >= self.width(),
+            "zext must widen: {} to {new_w}",
+            self.width()
+        );
         assert!(new_w <= 64, "width must be 1..=64, got {new_w}");
         Bv::wrap(Node::Zext(self.clone(), new_w))
     }
@@ -462,7 +497,11 @@ impl Bv {
     /// Panics unless `new_w` is between this value's width and 64.
     #[must_use]
     pub fn sext(&self, new_w: u32) -> Bv {
-        assert!(new_w >= self.width(), "sext must widen: {} to {new_w}", self.width());
+        assert!(
+            new_w >= self.width(),
+            "sext must widen: {} to {new_w}",
+            self.width()
+        );
         assert!(new_w <= 64, "width must be 1..=64, got {new_w}");
         Bv::wrap(Node::Sext(self.clone(), new_w))
     }
@@ -476,7 +515,11 @@ impl Bv {
     /// (`hi < width`). The result width is therefore always within 1..=64.
     #[must_use]
     pub fn extract(&self, hi: u32, lo: u32) -> Bv {
-        assert!(hi >= lo && hi < self.width(), "extract[{hi}:{lo}] out of range for width {}", self.width());
+        assert!(
+            hi >= lo && hi < self.width(),
+            "extract[{hi}:{lo}] out of range for width {}",
+            self.width()
+        );
         Bv::wrap(Node::Extract(self.clone(), hi, lo))
     }
 
@@ -488,7 +531,10 @@ impl Bv {
     #[must_use]
     pub fn concat(&self, low: &Bv) -> Bv {
         let w = self.width() + low.width();
-        assert!(w <= 64, "concatenation is {w} bits wide, over the 64-bit limit");
+        assert!(
+            w <= 64,
+            "concatenation is {w} bits wide, over the 64-bit limit"
+        );
         Bv::wrap(Node::Concat(self.clone(), low.clone()))
     }
 
@@ -501,8 +547,19 @@ impl Bv {
     /// Panics if `cond` is not 1 bit wide, or if `then` and `els` differ in width.
     #[must_use]
     pub fn ite(cond: &Bv, then: &Bv, els: &Bv) -> Bv {
-        assert_eq!(cond.width(), 1, "ite condition must be 1 bit, got {}", cond.width());
-        assert_eq!(then.width(), els.width(), "ite branches must match: {} and {}", then.width(), els.width());
+        assert_eq!(
+            cond.width(),
+            1,
+            "ite condition must be 1 bit, got {}",
+            cond.width()
+        );
+        assert_eq!(
+            then.width(),
+            els.width(),
+            "ite branches must match: {} and {}",
+            then.width(),
+            els.width()
+        );
         Bv::wrap(Node::Ite(cond.clone(), then.clone(), els.clone()))
     }
 
@@ -515,8 +572,18 @@ impl Bv {
     /// Panics if either operand is wider than 1 bit.
     #[must_use]
     pub fn land(&self, o: &Bv) -> Bv {
-        assert_eq!(self.width(), 1, "land operand must be 1 bit, got {}", self.width());
-        assert_eq!(o.width(), 1, "land operand must be 1 bit, got {}", o.width());
+        assert_eq!(
+            self.width(),
+            1,
+            "land operand must be 1 bit, got {}",
+            self.width()
+        );
+        assert_eq!(
+            o.width(),
+            1,
+            "land operand must be 1 bit, got {}",
+            o.width()
+        );
         self.and(o)
     }
 }
@@ -548,22 +615,41 @@ impl fmt::Display for Bv {
             Node::Neg(a) => write!(f, "(- {a})"),
             Node::Bin(op, a, b) => {
                 let s = match op {
-                    Op::And => "&", Op::Or => "|", Op::Xor => "^",
-                    Op::Add => "+", Op::Sub => "-", Op::Mul => "*",
-                    Op::Udiv => "/u", Op::Urem => "%u", Op::Sdiv => "/s", Op::Srem => "%s",
+                    Op::And => "&",
+                    Op::Or => "|",
+                    Op::Xor => "^",
+                    Op::Add => "+",
+                    Op::Sub => "-",
+                    Op::Mul => "*",
+                    Op::Udiv => "/u",
+                    Op::Urem => "%u",
+                    Op::Sdiv => "/s",
+                    Op::Srem => "%s",
                 };
                 write!(f, "({s} {a} {b})")
             }
             Node::ShlC(a, k) => write!(f, "(<< {a} {k})"),
-            Node::ShrC(a, k, arith) => write!(f, "({} {a} {k})", if *arith { ">>s" } else { ">>u" }),
+            Node::ShrC(a, k, arith) => {
+                write!(f, "({} {a} {k})", if *arith { ">>s" } else { ">>u" })
+            }
             Node::ShlV(a, k) => write!(f, "(<<v {a} {k})"),
-            Node::ShrV(a, k, arith) => write!(f, "({}v {a} {k})", if *arith { ">>s" } else { ">>u" }),
-            Node::RotC(a, k, left) => write!(f, "({} {a} {k})", if *left { "rotl" } else { "rotr" }),
-            Node::RotV(a, k, left) => write!(f, "({}v {a} {k})", if *left { "rotl" } else { "rotr" }),
+            Node::ShrV(a, k, arith) => {
+                write!(f, "({}v {a} {k})", if *arith { ">>s" } else { ">>u" })
+            }
+            Node::RotC(a, k, left) => {
+                write!(f, "({} {a} {k})", if *left { "rotl" } else { "rotr" })
+            }
+            Node::RotV(a, k, left) => {
+                write!(f, "({}v {a} {k})", if *left { "rotl" } else { "rotr" })
+            }
             Node::Compare(c, a, b) => {
                 let s = match c {
-                    Cmp::Eq => "==", Cmp::Ne => "!=", Cmp::Ult => "<u", Cmp::Ule => "<=u",
-                    Cmp::Slt => "<s", Cmp::Sle => "<=s",
+                    Cmp::Eq => "==",
+                    Cmp::Ne => "!=",
+                    Cmp::Ult => "<u",
+                    Cmp::Ule => "<=u",
+                    Cmp::Slt => "<s",
+                    Cmp::Sle => "<=s",
                 };
                 write!(f, "({s} {a} {b})")
             }

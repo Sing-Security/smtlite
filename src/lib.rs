@@ -101,7 +101,11 @@ pub struct Solver {
 
 impl Default for Solver {
     fn default() -> Self {
-        Self { vars: Vec::new(), asserts: Vec::new(), max_clauses: DEFAULT_MAX_CLAUSES }
+        Self {
+            vars: Vec::new(),
+            asserts: Vec::new(),
+            max_clauses: DEFAULT_MAX_CLAUSES,
+        }
     }
 }
 
@@ -142,7 +146,10 @@ impl Solver {
     /// in the crate is bounded by that; a wider variable would be unreadable and could not
     /// hold a constant.
     pub fn var(&mut self, name: &str, width: u32) -> Bv {
-        assert!((1..=64).contains(&width), "variable width must be 1..=64, got {width}");
+        assert!(
+            (1..=64).contains(&width),
+            "variable width must be 1..=64, got {width}"
+        );
         let id = self.vars.len();
         self.vars.push((name.to_string(), width));
         Bv::wrap(Node::Var(width, id))
@@ -168,7 +175,11 @@ impl Solver {
     /// ```
     #[must_use]
     pub fn depends_on(&self, bv: &Bv, prefix: &str) -> bool {
-        bv.var_ids().into_iter().any(|id| self.vars.get(id).is_some_and(|(n, _)| n.starts_with(prefix)))
+        bv.var_ids().into_iter().any(|id| {
+            self.vars
+                .get(id)
+                .is_some_and(|(n, _)| n.starts_with(prefix))
+        })
     }
 
     /// Assert that a 1-bit constraint must hold.
@@ -192,7 +203,12 @@ impl Solver {
     /// Panics if `constraint` is not 1 bit wide. A multi-bit value is not a proposition;
     /// blasting one bit of it would answer a question the caller did not ask.
     pub fn assert(&mut self, constraint: Bv) {
-        assert_eq!(constraint.width(), 1, "a constraint must be 1 bit, got {}", constraint.width());
+        assert_eq!(
+            constraint.width(),
+            1,
+            "a constraint must be 1 bit, got {}",
+            constraint.width()
+        );
         self.asserts.push(constraint);
     }
 
@@ -248,11 +264,21 @@ impl Solver {
     /// bound passes a real deadline here and lets the slowest query degrade instead of
     /// stalling everything behind it.
     #[must_use]
-    pub fn check_all_within(&self, constraints: &[Bv], budget: u64, deadline: std::time::Instant) -> Solution {
+    pub fn check_all_within(
+        &self,
+        constraints: &[Bv],
+        budget: u64,
+        deadline: std::time::Instant,
+    ) -> Solution {
         self.solve_constraints(constraints, budget, Some(deadline))
     }
 
-    fn solve_constraints(&self, constraints: &[Bv], budget: u64, deadline: Option<std::time::Instant>) -> Solution {
+    fn solve_constraints(
+        &self,
+        constraints: &[Bv],
+        budget: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> Solution {
         // One bump arena per solve holds every CNF clause; it drops (freeing the lot) when this
         // function returns. The `Model` we hand back copies its bits out, so it never borrows the arena.
         let bump = bumpalo::Bump::new();
@@ -265,8 +291,17 @@ impl Solver {
         }
         match b.cnf.solve_within(budget, deadline) {
             Sat(assignment) => {
-                let name_to_id = self.vars.iter().enumerate().map(|(id, (n, _))| (n.clone(), id)).collect();
-                Solution::Sat(Model { assignment, var_bits: b.var_bits, name_to_id })
+                let name_to_id = self
+                    .vars
+                    .iter()
+                    .enumerate()
+                    .map(|(id, (n, _))| (n.clone(), id))
+                    .collect();
+                Solution::Sat(Model {
+                    assignment,
+                    var_bits: b.var_bits,
+                    name_to_id,
+                })
             }
             Unsat => Solution::Unsat,
             Unknown => Solution::Unknown,
@@ -409,6 +444,9 @@ mod tests {
         s.assert(size.ult(&elem)); // wrapped
         s.assert(count.ugt(&Bv::val(0, 32)));
         let c = sat(&s).get("count").unwrap();
-        assert!(c.wrapping_mul(0x10) & 0xffff_ffff < 0x10, "count={c} should overflow");
+        assert!(
+            c.wrapping_mul(0x10) & 0xffff_ffff < 0x10,
+            "count={c} should overflow"
+        );
     }
 }

@@ -51,7 +51,11 @@ fn is_sat(s: &Solver) -> bool {
 
 /// A 4-bit vector read as two's-complement.
 fn s4(v: u64) -> i64 {
-    if v & 0x8 != 0 { v as i64 - 16 } else { v as i64 }
+    if v & 0x8 != 0 {
+        v as i64 - 16
+    } else {
+        v as i64
+    }
 }
 
 fn maskw(v: u64, w: u32) -> u64 {
@@ -116,7 +120,11 @@ fn udiv_urem_edges_width32() {
     ];
     for (a, b) in PAIRS {
         let (x, y) = (Bv::val(a, 32), Bv::val(b, 32));
-        let (q, r) = if b == 0 { (0xffff_ffff, a) } else { (a / b, a % b) };
+        let (q, r) = if b == 0 {
+            (0xffff_ffff, a)
+        } else {
+            (a / b, a % b)
+        };
         prove(&x.udiv(&y), q);
         prove(&x.urem(&y), r);
     }
@@ -135,7 +143,11 @@ fn udiv_urem_edges_width64() {
     ];
     for (a, b) in PAIRS {
         let (x, y) = (Bv::val(a, 64), Bv::val(b, 64));
-        let (q, r) = if b == 0 { (u64::MAX, a) } else { (a / b, a % b) };
+        let (q, r) = if b == 0 {
+            (u64::MAX, a)
+        } else {
+            (a / b, a % b)
+        };
         prove_capped(&x.udiv(&y), q, BIG);
         prove_capped(&x.urem(&y), r, BIG);
     }
@@ -201,15 +213,19 @@ fn srem_takes_the_sign_of_the_dividend_not_the_divisor() {
 #[test]
 fn sdiv_min_by_negative_one_wraps() {
     // The one signed division that overflows: MIN / -1 is unrepresentable and wraps to MIN.
-    prove_capped(&Bv::val(0x8000_0000, 32).sdiv(&Bv::val(0xffff_ffff, 32)), 0x8000_0000, BIG);
+    prove_capped(
+        &Bv::val(0x8000_0000, 32).sdiv(&Bv::val(0xffff_ffff, 32)),
+        0x8000_0000,
+        BIG,
+    );
     prove(&Bv::val(0x8000_0000, 32).srem(&Bv::val(0xffff_ffff, 32)), 0);
 }
 
 #[test]
 fn signed_division_edges_width32() {
     const PAIRS: [(u64, u64); 6] = [
-        (0xffff_fffb, 3),          // -5 / 3
-        (5, 0xffff_fffd),          // 5 / -3
+        (0xffff_fffb, 3),           // -5 / 3
+        (5, 0xffff_fffd),           // 5 / -3
         (0x8000_0000, 0xffff_fffe), // MIN / -2
         (0xffff_fffb, 0xffff_fffd), // -5 / -3
         (0x7fff_ffff, 0xffff_ffff), // MAX / -1
@@ -292,7 +308,11 @@ fn ashr_var_exhaustive_amounts_width8() {
     let a = 0b1011_0011u64; // negative
     let pos = 0b0011_0011u64;
     for k in 0..24u64 {
-        let expected = if k >= 8 { 0xff } else { ((a as i8) >> k) as u8 as u64 };
+        let expected = if k >= 8 {
+            0xff
+        } else {
+            ((a as i8) >> k) as u8 as u64
+        };
         prove(&Bv::val(a, 8).ashr_var(&Bv::val(k, 8)), expected);
         // A non-negative value must NOT sign-fill.
         let exp_pos = if k >= 8 { 0 } else { pos >> k };
@@ -366,7 +386,12 @@ fn rot_const_is_a_permutation_not_a_shift() {
 
 #[test]
 fn rot_const_non_power_of_two_widths() {
-    for &(a, w) in &[(0b1_0101u64, 5u32), (0b101u64, 3), (0b101_1010u64, 7), (0b1_1u64, 6)] {
+    for &(a, w) in &[
+        (0b1_0101u64, 5u32),
+        (0b101u64, 3),
+        (0b101_1010u64, 7),
+        (0b1_1u64, 6),
+    ] {
         for k in 0..=14u32 {
             prove(&Bv::val(a, w).rotl(k), rotl_bits(a, k, w));
             prove(&Bv::val(a, w).rotr(k), rotr_bits(a, k, w));
@@ -379,8 +404,14 @@ fn rot_var_exhaustive_amounts_width8() {
     // Power-of-two width: the low three bits of the amount are already it modulo 8.
     let a = 0b1101_0011u64;
     for k in 0..=40u64 {
-        prove(&Bv::val(a, 8).rotl_var(&Bv::val(k, 8)), (a as u8).rotate_left(k as u32) as u64);
-        prove(&Bv::val(a, 8).rotr_var(&Bv::val(k, 8)), (a as u8).rotate_right(k as u32) as u64);
+        prove(
+            &Bv::val(a, 8).rotl_var(&Bv::val(k, 8)),
+            (a as u8).rotate_left(k as u32) as u64,
+        );
+        prove(
+            &Bv::val(a, 8).rotr_var(&Bv::val(k, 8)),
+            (a as u8).rotate_right(k as u32) as u64,
+        );
     }
 }
 
@@ -391,8 +422,14 @@ fn rot_var_non_power_of_two_widths() {
         // be masked on the way in and the oracle would be comparing against a different shift.
         let span = (1u64 << w).min(41);
         for k in 0..span {
-            prove(&Bv::val(a, w).rotl_var(&Bv::val(k, w)), rotl_bits(a, k as u32, w));
-            prove(&Bv::val(a, w).rotr_var(&Bv::val(k, w)), rotr_bits(a, k as u32, w));
+            prove(
+                &Bv::val(a, w).rotl_var(&Bv::val(k, w)),
+                rotl_bits(a, k as u32, w),
+            );
+            prove(
+                &Bv::val(a, w).rotr_var(&Bv::val(k, w)),
+                rotr_bits(a, k as u32, w),
+            );
         }
     }
 }
@@ -404,8 +441,14 @@ fn rot_var_amount_wider_than_width() {
     // `2^w` — for w=5 and k=32 it gives 0 where the answer is 2.
     let a = 0b1_0011u64;
     for k in [0u64, 1, 4, 5, 6, 31, 32, 33, 100, 1023, 0xffff] {
-        prove(&Bv::val(a, 5).rotl_var(&Bv::val(k, 16)), rotl_bits(a, (k % 5) as u32, 5));
-        prove(&Bv::val(a, 5).rotr_var(&Bv::val(k, 16)), rotr_bits(a, (k % 5) as u32, 5));
+        prove(
+            &Bv::val(a, 5).rotl_var(&Bv::val(k, 16)),
+            rotl_bits(a, (k % 5) as u32, 5),
+        );
+        prove(
+            &Bv::val(a, 5).rotr_var(&Bv::val(k, 16)),
+            rotr_bits(a, (k % 5) as u32, 5),
+        );
     }
 }
 
@@ -414,7 +457,10 @@ fn rot_var_amount_narrower_than_the_vector() {
     // A 3-bit amount cannot reach the width, so the modulo reduction is never exercised.
     let a = 0b1011_0011u64;
     for k in 0..8u64 {
-        prove(&Bv::val(a, 8).rotl_var(&Bv::val(k, 3)), (a as u8).rotate_left(k as u32) as u64);
+        prove(
+            &Bv::val(a, 8).rotl_var(&Bv::val(k, 3)),
+            (a as u8).rotate_left(k as u32) as u64,
+        );
     }
 }
 
@@ -424,7 +470,11 @@ fn symbolic_rotate_amount_from_a_variable() {
     // answer unique: a rotate is periodic in the width, so an 8-bit amount would also admit 251.
     let mut s = Solver::new();
     let k = s.var("k", 3);
-    s.assert(Bv::val(0b1000_0001, 8).rotl_var(&k).eq(&Bv::val(0b0000_1100, 8)));
+    s.assert(
+        Bv::val(0b1000_0001, 8)
+            .rotl_var(&k)
+            .eq(&Bv::val(0b0000_1100, 8)),
+    );
     match s.check() {
         Solution::Sat(m) => assert_eq!(m.get("k"), Some(3)),
         other => panic!("expected SAT, got {other:?}"),
@@ -437,7 +487,11 @@ fn symbolic_rotate_amount_is_only_unique_modulo_the_width() {
     // congruent to 3 modulo 8, so `k mod 8 == 3` must hold and the raw value must not be pinned.
     let mut s = Solver::new();
     let k = s.var("k", 8);
-    s.assert(Bv::val(0b1000_0001, 8).rotl_var(&k).eq(&Bv::val(0b0000_1100, 8)));
+    s.assert(
+        Bv::val(0b1000_0001, 8)
+            .rotl_var(&k)
+            .eq(&Bv::val(0b0000_1100, 8)),
+    );
     match s.check() {
         Solution::Sat(m) => assert_eq!(m.get("k").unwrap() % 8, 3),
         other => panic!("expected SAT, got {other:?}"),
@@ -482,7 +536,10 @@ fn sgt_sge_are_the_mirror_of_slt_sle() {
             let mut s = Solver::new();
             s.assert(x.sgt(&y));
             s.assert(y.slt(&x).not());
-            assert!(matches!(s.check(), Solution::Unsat), "sgt and slt disagree for {a},{b}");
+            assert!(
+                matches!(s.check(), Solution::Unsat),
+                "sgt and slt disagree for {a},{b}"
+            );
         }
     }
 }

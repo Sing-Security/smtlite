@@ -25,7 +25,12 @@ impl<'b> Blaster<'b> {
         let mut cnf = Cnf::new(bump);
         let true_lit = cnf.new_var();
         cnf.add_clause(&[true_lit]); // pin it true, so its negation is a constant false
-        Self { cnf, true_lit, memo: HashMap::new(), var_bits: HashMap::new() }
+        Self {
+            cnf,
+            true_lit,
+            memo: HashMap::new(),
+            var_bits: HashMap::new(),
+        }
     }
 
     fn t(&self) -> i32 {
@@ -108,7 +113,15 @@ impl<'b> Blaster<'b> {
     fn encode_node(&mut self, bv: &Bv) -> Vec<i32> {
         let w = bv.width() as usize;
         match &*bv.0 {
-            Node::Const(_, v) => (0..w).map(|i| if (v >> i) & 1 == 1 { self.t() } else { self.f() }).collect(),
+            Node::Const(_, v) => (0..w)
+                .map(|i| {
+                    if (v >> i) & 1 == 1 {
+                        self.t()
+                    } else {
+                        self.f()
+                    }
+                })
+                .collect(),
             Node::Var(_, id) => {
                 let bits: Vec<i32> = (0..w).map(|_| self.cnf.new_var()).collect();
                 self.var_bits.insert(*id, bits.clone());
@@ -141,13 +154,17 @@ impl<'b> Blaster<'b> {
             Node::ShlC(a, k) => {
                 let ab = self.encode(a);
                 let k = *k as usize;
-                (0..w).map(|i| if i < k { self.f() } else { ab[i - k] }).collect()
+                (0..w)
+                    .map(|i| if i < k { self.f() } else { ab[i - k] })
+                    .collect()
             }
             Node::ShrC(a, k, arith) => {
                 let ab = self.encode(a);
                 let k = *k as usize;
                 let fill = if *arith { ab[w - 1] } else { self.f() };
-                (0..w).map(|i| if i + k < w { ab[i + k] } else { fill }).collect()
+                (0..w)
+                    .map(|i| if i + k < w { ab[i + k] } else { fill })
+                    .collect()
             }
             Node::ShlV(a, k) => {
                 let ab = self.encode(a);
@@ -157,7 +174,11 @@ impl<'b> Blaster<'b> {
             Node::ShrV(a, k, arith) => {
                 let ab = self.encode(a);
                 let kb = self.encode(k);
-                let kind = if *arith { ShKind::Aright } else { ShKind::Lright };
+                let kind = if *arith {
+                    ShKind::Aright
+                } else {
+                    ShKind::Lright
+                };
                 self.shift_var_bits(&ab, &kb, kind)
             }
             Node::RotC(a, k, left) => {
@@ -213,11 +234,13 @@ impl<'b> Blaster<'b> {
             Node::Ite(cond, then, els) => {
                 let c = self.encode(cond)[0];
                 let (tb, eb) = (self.encode(then), self.encode(els));
-                (0..w).map(|i| {
-                    let a = self.and(c, tb[i]);
-                    let b = self.and(-c, eb[i]);
-                    self.or(a, b)
-                }).collect()
+                (0..w)
+                    .map(|i| {
+                        let a = self.and(c, tb[i]);
+                        let b = self.and(-c, eb[i]);
+                        self.or(a, b)
+                    })
+                    .collect()
             }
         }
     }
@@ -267,7 +290,15 @@ impl<'b> Blaster<'b> {
 
     /// Bit literals for the constant `v`, zero-extended (or truncated) to `w` bits.
     fn const_bits(&mut self, v: u64, w: usize) -> Vec<i32> {
-        (0..w).map(|i| if (v >> i) & 1 == 1 { self.t() } else { self.f() }).collect()
+        (0..w)
+            .map(|i| {
+                if (v >> i) & 1 == 1 {
+                    self.t()
+                } else {
+                    self.f()
+                }
+            })
+            .collect()
     }
 
     /// Two's-complement absolute value: `sign ? -a : a`.
@@ -395,7 +426,9 @@ impl<'b> Blaster<'b> {
         }
         if stages > 0 && (1usize << stages) != w {
             // The width is not a power of two, so an amount below 2^stages can still reach it.
-            let low: Vec<i32> = (0..stages).map(|j| k.get(j).copied().unwrap_or(f)).collect();
+            let low: Vec<i32> = (0..stages)
+                .map(|j| k.get(j).copied().unwrap_or(f))
+                .collect();
             let wbits = self.const_bits(w as u64, stages);
             let ge = -self.ult_bits(&low, &wbits);
             overflow = self.or(overflow, ge);
@@ -422,7 +455,9 @@ impl<'b> Blaster<'b> {
         }
         let amount: Vec<i32> = if (1usize << stages) == w {
             // Power-of-two width: the low `stages` bits already are `k mod w`.
-            (0..stages).map(|j| k.get(j).copied().unwrap_or(f)).collect()
+            (0..stages)
+                .map(|j| k.get(j).copied().unwrap_or(f))
+                .collect()
         } else {
             // Otherwise the amount has to be reduced modulo the width explicitly. The divider runs
             // at the wider of the two operands rather than truncating `k` to `w` bits: `k mod w`
@@ -442,7 +477,11 @@ impl<'b> Blaster<'b> {
             let sh = (1usize << j) % w;
             let mut rotated = Vec::with_capacity(w);
             for i in 0..w {
-                rotated.push(if left { cur[(i + w - sh) % w] } else { cur[(i + sh) % w] });
+                rotated.push(if left {
+                    cur[(i + w - sh) % w]
+                } else {
+                    cur[(i + sh) % w]
+                });
             }
             cur = self.mux_vec(sel, &rotated, &cur);
         }
@@ -455,7 +494,12 @@ impl<'b> Blaster<'b> {
     ///
     /// Panics if `bv` is not 1 bit wide.
     pub fn assert_true(&mut self, bv: &Bv) {
-        assert_eq!(bv.width(), 1, "a constraint must be 1 bit, got {}", bv.width());
+        assert_eq!(
+            bv.width(),
+            1,
+            "a constraint must be 1 bit, got {}",
+            bv.width()
+        );
         let bits = self.encode(bv);
         self.cnf.add_clause(&[bits[0]]);
     }
@@ -486,6 +530,12 @@ fn rot_const(a: &[i32], k: u32, left: bool) -> Vec<i32> {
     let w = a.len();
     let sh = (k as usize) % w;
     (0..w)
-        .map(|i| if left { a[(i + w - sh) % w] } else { a[(i + sh) % w] })
+        .map(|i| {
+            if left {
+                a[(i + w - sh) % w]
+            } else {
+                a[(i + sh) % w]
+            }
+        })
         .collect()
 }

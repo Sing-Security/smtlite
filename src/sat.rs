@@ -41,7 +41,11 @@ impl<'b> Cnf<'b> {
     /// An empty formula over zero variables, whose clauses will be allocated in `bump`.
     #[must_use]
     pub fn new(bump: &'b bumpalo::Bump) -> Self {
-        Self { nvars: 0, clauses: Vec::new(), bump }
+        Self {
+            nvars: 0,
+            clauses: Vec::new(),
+            bump,
+        }
     }
 
     /// Allocate a fresh variable, returning its positive literal.
@@ -103,7 +107,9 @@ impl<'b> Cnf<'b> {
             } else {
                 // No conflict — pick the next unassigned variable to branch on.
                 match assign.iter().position(Option::is_none) {
-                    None => return SatResult::Sat(assign.iter().map(|a| a.unwrap_or(false)).collect()),
+                    None => {
+                        return SatResult::Sat(assign.iter().map(|a| a.unwrap_or(false)).collect());
+                    }
                     Some(v) => {
                         decisions += 1;
                         if decisions > budget {
@@ -120,7 +126,12 @@ impl<'b> Cnf<'b> {
     }
 
     /// Unit propagation to a fixpoint. Returns `true` on conflict.
-    fn propagate(&self, assign: &mut [Option<bool>], trail: &mut Vec<usize>, is_decision: &mut [bool]) -> bool {
+    fn propagate(
+        &self,
+        assign: &mut [Option<bool>],
+        trail: &mut Vec<usize>,
+        is_decision: &mut [bool],
+    ) -> bool {
         loop {
             let mut changed = false;
             for clause in &self.clauses {
