@@ -44,6 +44,7 @@
 //!
 //! A [`Bv`] is an `Rc`-shared node, so neither [`Bv`] nor [`Solver`] is `Send` or `Sync` — one
 //! solve runs on one thread.
+#![cfg_attr(doctest, doc = include_str!("../README.md"))]
 
 mod blast;
 mod bv;
