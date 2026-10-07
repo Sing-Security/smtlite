@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Format, Lint, Test, Package Dry-Run
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Caches the registry and `target/` itself.
+      - name: Install Rust toolchain (stable)
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          components: clippy, rustfmt
+
+      - name: Show rustc / cargo versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Run rustfmt (check)
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Release as well as debug: the width preconditions were `debug_assert!`-only until this
+      # release, so a debug-only run would not have caught a release build shifting past 64 bits.
+      - name: Run tests (debug)
+        run: cargo test --all-features -- --nocapture
+
+      - name: Run tests (release)
+        run: cargo test --release --all-features
+
+      - name: Build docs
+        run: cargo doc --no-deps
+
+      - name: cargo package dry-run
+        run: cargo package --allow-dirty
+
+      - name: cargo publish dry-run
+        run: cargo publish --dry-run
