@@ -3,14 +3,12 @@
 //! rather than running without a bound.
 //!
 //! Literals are `i32`: `+(v+1)` for the positive polarity of variable `v`, `-(v+1)` for the
-//! negative. Variable 0 is literal `1` / `-1`. Correctness is the priority here over raw
-//! speed — the formulas the bit-blaster produces for a directed query are small (hundreds to
-//! a few thousand clauses), and this solves those reliably.
+//! negative. Variable 0 is literal `1` / `-1`.
 //!
-//! Deliberately absent: pure-literal elimination, watched literals, clause learning and
+//! Not present: pure-literal elimination, watched literals, clause learning and
 //! non-chronological backjumping. The clause set is re-scanned to a fixpoint on every
-//! propagation pass, which is why the caller passes a wall-clock deadline alongside the
-//! decision budget — see [`Cnf::solve_within`].
+//! propagation pass, which is why a sweep passes a wall-clock deadline alongside the decision
+//! budget — see [`Cnf::solve_within`].
 
 /// A CNF formula: `nvars` boolean variables and a conjunction of clauses (each a disjunction
 /// of literals). Clauses are allocated in a bump arena `'b` — a directed query produces thousands
@@ -66,10 +64,11 @@ impl<'b> Cnf<'b> {
         self.clauses.push(self.bump.alloc_slice_copy(lits));
     }
 
-    /// Solve, bounded by BOTH a decision budget and an optional wall-clock `deadline`. The decision
-    /// budget alone is a poor time proxy — a propagation-heavy formula burns seconds between
-    /// decisions (`propagate` rescans every clause per fixpoint) — so a sweep passes a real deadline
-    /// to cap the slowest single query and stop it flooring the batch's wall-clock.
+    /// Solve, bounded by both a decision budget and an optional wall-clock `deadline`.
+    ///
+    /// The budget alone is a poor time proxy: `propagate` rescans every clause per fixpoint, so a
+    /// propagation-heavy formula burns seconds between decisions. A deadline caps the slowest
+    /// single query instead.
     #[must_use]
     pub fn solve_within(&self, budget: u64, deadline: Option<std::time::Instant>) -> SatResult {
         let n = self.nvars;
@@ -80,9 +79,8 @@ impl<'b> Cnf<'b> {
         let mut decisions = 0u64;
 
         loop {
-            // Check the clock once per decision/conflict cycle. When `propagate` dominates (few, slow
-            // iterations) this still fires promptly; when iterations are many and fast the `Instant`
-            // cost is negligible next to the propagation work each iteration already did.
+            // Once per decision/conflict cycle: often enough to fire when `propagate` dominates,
+            // cheap enough to ignore when the iterations are many and fast.
             if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                 return SatResult::Unknown;
             }

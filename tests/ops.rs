@@ -8,9 +8,9 @@
 //! Integers here are width-`w` two's-complement bitvectors. `u64` values must be pre-masked to `w`
 //! bits; a test that feeds an unmasked value is testing the test.
 
-// The oracle spells out the zero-divisor cases as `if b == 0 { … } else { a / b }` because that
-// branch *is* the SMT-LIB definition being checked (`bvudiv` by zero is all-ones, `bvurem` by zero
-// is the dividend). `checked_div` would hide the very semantics under test.
+// The oracle writes the zero-divisor case out as `if b == 0 { … } else { a / b }` rather than
+// calling `checked_div`, which would hide the semantics under test: `bvudiv` by zero is all-ones
+// and `bvurem` by zero is the dividend.
 #![allow(clippy::manual_checked_ops)]
 
 use smtlite::{Bv, Solution, Solver};
@@ -35,8 +35,7 @@ fn prove_capped(expr: &Bv, expected: u64, cap: usize) {
         "`{expr}` should be able to equal #{expected:x} ({w} bits)"
     );
 
-    // The load-bearing half: no assignment anywhere in the (constant) circuit differs from the
-    // oracle value.
+    // The UNSAT half: no assignment in the circuit differs from the oracle value.
     let mut unsat = Solver::new().with_max_clauses(cap);
     unsat.assert(expr.ne(&want));
     assert!(

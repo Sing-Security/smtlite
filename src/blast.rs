@@ -327,9 +327,8 @@ impl<'b> Blaster<'b> {
         let not_b: Vec<i32> = bext.iter().map(|&l| -l).collect();
         let mut quot = vec![self.f(); w];
         for i in (0..w).rev() {
-            // Fold the next dividend bit in. Bits are little-endian, so the incoming bit is
-            // *less* significant than everything already in `rem`: it goes to index 0 and the
-            // rest slides up one — which is `rem << 1 | a[i]` read the other way round.
+            // Fold the next dividend bit in. Little-endian, so it is *less* significant than
+            // everything in `rem`: index 0, the rest slides up — `rem << 1 | a[i]` reversed.
             let mut shifted = Vec::with_capacity(w + 1);
             shifted.push(a[i]);
             shifted.extend_from_slice(&rem[0..w]);
@@ -459,10 +458,10 @@ impl<'b> Blaster<'b> {
                 .map(|j| k.get(j).copied().unwrap_or(f))
                 .collect()
         } else {
-            // Otherwise the amount has to be reduced modulo the width explicitly. The divider runs
-            // at the wider of the two operands rather than truncating `k` to `w` bits: `k mod w`
-            // depends on every bit of `k`, and `(k mod 2^w) mod w` differs from it whenever `w`
-            // does not divide `2^w` (w=5, k=32: truncating gives 0, but 32 mod 5 = 2).
+            // Otherwise reduce the amount modulo the width explicitly. The divider runs at the
+            // wider operand rather than truncating `k` to `w` bits: `k mod w` depends on every bit
+            // of `k`, and truncating is wrong whenever `w` does not divide `2^w` (w=5, k=32
+            // truncates to 0, but 32 mod 5 = 2).
             let m = w.max(k.len());
             let mut kext = k.to_vec();
             kext.resize(m, f);
@@ -471,8 +470,8 @@ impl<'b> Blaster<'b> {
             r[0..stages].to_vec() // r < w <= 2^stages, so it fits in `stages` bits
         };
         let mut cur = a.to_vec();
-        // `amount` is exactly `stages` bits in both branches above, so enumerating it directly
-        // walks the barrel one stage at a time.
+        // `amount` is exactly `stages` bits in both branches, so this walks the barrel one
+        // stage at a time.
         for (j, &sel) in amount.iter().enumerate() {
             let sh = (1usize << j) % w;
             let mut rotated = Vec::with_capacity(w);

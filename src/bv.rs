@@ -128,9 +128,8 @@ impl Bv {
     /// and dedups on node identity, so it terminates on any DAG however deep.
     #[must_use]
     pub fn var_ids(&self) -> Vec<usize> {
-        // Iterative worklist, not recursion: a deep expression chain (e.g. a long dataflow of a
-        // pointer through many ops) would otherwise overflow the stack. `seen` (by Rc identity)
-        // dedups shared subgraphs so a DAG is walked once.
+        // Iterative: a deep expression chain would overflow the stack. `seen` dedups by node
+        // identity, so a shared subgraph is walked once.
         let mut seen = std::collections::HashSet::new();
         let mut ids = Vec::new();
         let mut stack = vec![self.clone()];
@@ -596,17 +595,15 @@ pub fn mask(v: u64, w: u32) -> u64 {
 }
 
 impl fmt::Debug for Bv {
-    // The same canonical s-expression as `Display`, wrapped so the two are distinguishable in
-    // a debug print.
+    // `Display`'s s-expression, wrapped so a debug print can tell the two apart.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Bv({self})")
     }
 }
 
 impl fmt::Display for Bv {
-    // A canonical s-expression: each node prints its own operator and recurses, so two
-    // structurally identical expressions print identically. Stable enough to key a memory
-    // slot by, and readable enough to put in a trace.
+    // Canonical s-expression: structurally identical expressions print identically, so this is
+    // stable enough to key a memory slot by.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &*self.0 {
             Node::Const(w, v) => write!(f, "#{v:x}:{w}"),

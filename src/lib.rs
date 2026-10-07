@@ -29,18 +29,15 @@
 //!
 //! # Bounded by construction
 //!
-//! A solve can always be told when to give up rather than be allowed to run away:
+//! Three bounds, any of which yields [`Solution::Unknown`] rather than a wrong verdict:
 //! [`Solver::check_with_budget`] caps decisions, [`Solver::check_all_within`] adds a
-//! wall-clock deadline, and [`Solver::with_max_clauses`] caps the formula size. Any of them
-//! being hit yields [`Solution::Unknown`], never a wrong verdict.
+//! wall-clock deadline, and [`Solver::with_max_clauses`] caps the formula size.
 //!
 //! # Width and threading limits
 //!
-//! Widths are 1..=64 bits, because [`Model::get`] reads a variable back as a `u64`. Nothing
-//! silently wraps around that: an operation whose result or target width would fall outside
-//! 1..=64 **panics**, as does one given two operands of different widths. A malformed formula
-//! is a bug in the caller, and a panic is better than a quietly wrong verdict. Each such
-//! method says so under `# Panics`.
+//! Widths are 1..=64 bits, because [`Model::get`] reads a variable back as a `u64`. An
+//! operation whose result or target width would fall outside 1..=64 **panics**, as does one
+//! given two operands of different widths; each such method says so under `# Panics`.
 //!
 //! A [`Bv`] is an `Rc`-shared node, so neither [`Bv`] nor [`Solver`] is `Send` or `Sync` — one
 //! solve runs on one thread.
@@ -64,10 +61,10 @@ const DEFAULT_BUDGET: u64 = 4_000_000;
 /// Default formula-size cap: a blasted formula larger than this is [`Solution::Unknown`] without
 /// being solved at all.
 ///
-/// `propagate` rescans every clause per fixpoint, so a huge circuit (deep path constraints over
-/// 64-bit multiplies) can burn minutes at a low *decision* count. Every operation at 32 bits fits
-/// under 40,000 clauses; a **64-bit division needs roughly 110,000**, so a caller that genuinely
-/// needs one raises the cap deliberately via [`Solver::with_max_clauses`].
+/// `propagate` rescans every clause per fixpoint, so a huge circuit can burn minutes at a low
+/// *decision* count. Every operation at 32 bits fits; a **64-bit division needs roughly
+/// 110,000 clauses**, so a caller that needs one raises the cap via
+/// [`Solver::with_max_clauses`].
 const DEFAULT_MAX_CLAUSES: usize = 40_000;
 
 /// The answer to a satisfiability query, three-valued.
@@ -250,9 +247,8 @@ impl Solver {
 
     /// [`check_all`](Self::check_all) with an explicit decision budget.
     ///
-    /// A caller running many queries (a sweep over a corpus, say) uses a small budget so one
-    /// hard instance degrades to [`Solution::Unknown`] quickly instead of dominating the
-    /// batch's wall-clock.
+    /// A sweep over many queries uses a small budget, so one hard instance degrades to
+    /// [`Solution::Unknown`] instead of dominating the batch's wall-clock.
     #[must_use]
     pub fn check_all_with_budget(&self, constraints: &[Bv], budget: u64) -> Solution {
         self.solve_constraints(constraints, budget, None)
@@ -260,10 +256,9 @@ impl Solver {
 
     /// [`check_all_with_budget`](Self::check_all_with_budget) plus a wall-clock `deadline`.
     ///
-    /// The decision budget alone bounds decisions, not time — one propagation-heavy formula
-    /// can burn seconds between decisions — so a batch that must finish inside a wall-clock
-    /// bound passes a real deadline here and lets the slowest query degrade instead of
-    /// stalling everything behind it.
+    /// The budget bounds decisions, not time. A batch that has to finish inside a wall-clock
+    /// bound passes a deadline here, so the slowest query degrades rather than stalling the
+    /// rest.
     #[must_use]
     pub fn check_all_within(
         &self,
@@ -280,8 +275,8 @@ impl Solver {
         budget: u64,
         deadline: Option<std::time::Instant>,
     ) -> Solution {
-        // One bump arena per solve holds every CNF clause; it drops (freeing the lot) when this
-        // function returns. The `Model` we hand back copies its bits out, so it never borrows the arena.
+        // One arena per solve holds every clause and drops when this function returns. The
+        // `Model` we hand back copies its bits out, so it never borrows the arena.
         let bump = bumpalo::Bump::new();
         let mut b = Blaster::new(&bump);
         for c in constraints {
@@ -436,8 +431,7 @@ mod tests {
 
     #[test]
     fn test_overflow_in_size_math() {
-        // The classic shape: `count * elem` overflows a 32-bit size, so the product wraps below
-        // `elem` — the "integer overflow in an allocation size" question this crate exists for.
+        // `count * elem` overflows a 32-bit size, so the product wraps below `elem`.
         let mut s = Solver::new();
         let count = s.var("count", 32);
         let elem = Bv::val(0x10, 32);
