@@ -225,6 +225,29 @@ fn assumption_budget_and_deadline_variants_degrade_the_same_way() {
     ));
 }
 
+#[test]
+fn assumption_models_read_back_background_only_variables() {
+    // The cache seeds the assumption blaster with every declared variable's bits, so a model from
+    // `check_assumptions` is total over the declaration: it reads back a variable only the stored
+    // background mentions, and one only the assumption mentions.
+    let mut s = Solver::new();
+    let x = s.var("x", 8);
+    let y = s.var("y", 8);
+    s.assert(x.eq(&Bv::val(5, 8))); // background: x == 5, y untouched
+
+    match s.check_assumptions(&[y.eq(&Bv::val(7, 8))]) {
+        Solution::Sat(m) => {
+            assert_eq!(m.get("x"), Some(5), "a background-only variable reads back");
+            assert_eq!(
+                m.get("y"),
+                Some(7),
+                "an assumption-only variable reads back"
+            );
+        }
+        other => panic!("expected SAT, got {other:?}"),
+    }
+}
+
 // ---- Provenance ---------------------------------------------------------------------------
 
 #[test]
