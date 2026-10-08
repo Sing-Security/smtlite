@@ -5,6 +5,32 @@ All notable changes to smtlite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-10-08
+
+### Added
+
+- **`check_assumptions`, `check_assumptions_with_budget`, `check_assumptions_within`.** Solve the
+  stored background plus a set of one-bit per-call assumptions, without re-blasting the background.
+  `var` and `assert` invalidate the cached blast; `check_all` keeps its explicit whole-formula
+  semantics.
+
+### Changed
+
+- **Expressions fold constants and identities when they are built.** Every combinator now folds
+  constant operands (with SMT-LIB zero-divisor semantics) and width-aware identities - `x + 0`,
+  `x - x`, `~~x`, self-comparisons - before a node is created, so a folded result is shared with
+  every later use of the same subexpression. `as_const` reflects this: `val(1).add(val(1))` reads
+  back as a constant, and `a + b == b + a` at width 16/32, which used to exhaust the decision
+  budget, now folds to `Unsat`.
+- **Unit propagation watches two literals per clause**, processing trail assignments instead of
+  rescanning the clause set to a fixpoint. Pigeonhole(9, 8) went from 9.6 s to 0.12 s (release).
+- **Branching prefers the unassigned variable with the most conflict activity** (VSIDS-style,
+  bumped per conflict) and tries its last-assigned value first (phase saving).
+- **The clause set is simplified once before the search.** Unit clauses force their literal, so
+  clauses holding a forced literal are satisfied, the negation of a forced literal drops out, and
+  tautological and duplicate clauses go; a clause whose literals all drop out settles the query
+  unsat without any search.
+
 ## [0.1.1] - 2026-10-08
 
 ### Added

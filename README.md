@@ -47,6 +47,11 @@ match s.check() {
 actually derive from the data read out of the input, or is it still something the caller started
 with? Name variables by origin (`mem...`, `init_...`) and the prefix tells you which.
 
+`Solver::check_assumptions` solves the stored background plus a set of one-bit per-path
+constraints, without re-blasting the background. A symbolic-execution sweep asserts its input
+once, then fires per-path queries against it; `var` and `assert` invalidate the cached blast, so
+later declarations still read back in the model.
+
 ## What it deliberately does not do
 
 - **Arrays, uninterpreted functions, or quantifiers.** This is QF_BV only.
@@ -96,10 +101,13 @@ memoised on the `Rc` pointer, so a value appearing in several constraints is enc
 CNF clauses are arena-allocated (`bumpalo`): a query produces thousands of tiny, same-lifetime
 clauses, so one arena reset frees the whole formula instead of freeing clause-by-clause.
 
-The SAT core is iterative DPLL - unit propagation to a fixpoint, then chronological
-branch-and-flip backtracking. Correctness is preferred over raw speed, because the formulas a
-directed query produces are small - hundreds to a few thousand clauses, with division the
-notable exception (see **Cost** above).
+The SAT core is iterative DPLL with two-watched-literal unit propagation and chronological
+branch-and-flip backtracking. Before the search, one assignment-free pass drops tautological and
+duplicate clauses and lets unit clauses force their literal. Branching prefers the unassigned
+variable with the most conflict activity (VSIDS) and tries its last-assigned value first (phase
+saving). Correctness is preferred over raw speed, because the formulas a directed query produces
+are small - hundreds to a few thousand clauses, with division the notable exception (see **Cost**
+above).
 
 ## Bounded by construction
 
