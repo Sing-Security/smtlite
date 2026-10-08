@@ -108,7 +108,9 @@ A solver embedded in a batch job must never hang it. Three guards, all of which 
 
 - a **decision budget** (`check_with_budget`, `check_all_with_budget`),
 - a **wall-clock deadline** (`check_all_within`), because a propagation-heavy formula can burn
-  seconds between decisions, making a decision count a poor time proxy,
+  seconds between decisions, making a decision count a poor time proxy - the deadline is checked
+  both between decisions and within unit propagation, so it bounds a query rather than a decision
+  count,
 - a **formula-size cap** (40,000 clauses by default): past that the instance is pathological and is
   better left to a manual walk-through than allowed to stall a sweep. Every operation at 32 bits
   fits under it; raise it with `Solver::with_max_clauses` for a 64-bit division, and pair that with

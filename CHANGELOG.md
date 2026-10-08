@@ -5,6 +5,29 @@ All notable changes to smtlite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Three test suites beyond the per-operation conformance tests.** `tests/differential.rs` checks
+  generated expressions against an independent evaluator - exhaustively at small widths, and by
+  metamorphic identity elsewhere; `tests/contracts.rs` pins every documented panic; `tests/api.rs`
+  covers model readback, budgeting and provenance.
+
+### Fixed
+
+- **`Model::get` reads back a declared variable no constraint mentioned.** The blaster recorded a
+  variable's SAT bits only when a constraint encoded it, so an unused variable returned `None`
+  from a model documented as total. Every declared variable's bits are now allocated up front.
+- **The SAT core no longer branches on a variable that occurs in no clause.** Such a variable is
+  free, so any value satisfies the formula, and deciding one only adds search the solver must
+  unwind. With the fix above giving every declared variable SAT bits, unrelated declarations made
+  refutations slower by orders of magnitude - one small width-4 formula went from 30 microseconds
+  to over 2 seconds, and from `Unsat` to `Unknown`, once eight unrelated variables were declared.
+- **The wall-clock deadline is checked inside unit propagation**, not only between decisions.
+  `propagate` rescans the clause set to a fixpoint, so a propagation-heavy query could run past a
+  `check_all_within` deadline before the next check; the deadline is now tested once per scan.
+
 ## [0.1.0] - 2026-10-07
 
 First public release. Written for directed, single-function queries - "is there an input that

@@ -40,6 +40,16 @@ impl<'b> Blaster<'b> {
         -self.true_lit
     }
 
+    /// Allocate the SAT bits for a declared variable up front, so it reads back in a model even
+    /// when no constraint mentions it. Idempotent per `id`: a repeat call keeps the original bits.
+    pub fn declare_var(&mut self, id: usize, width: u32) {
+        if self.var_bits.contains_key(&id) {
+            return;
+        }
+        let bits: Vec<i32> = (0..width).map(|_| self.cnf.new_var()).collect();
+        self.var_bits.insert(id, bits);
+    }
+
     fn and(&mut self, a: i32, b: i32) -> i32 {
         let o = self.cnf.new_var();
         self.cnf.add_clause(&[-o, a]);
@@ -123,9 +133,16 @@ impl<'b> Blaster<'b> {
                 })
                 .collect(),
             Node::Var(_, id) => {
-                let bits: Vec<i32> = (0..w).map(|_| self.cnf.new_var()).collect();
-                self.var_bits.insert(*id, bits.clone());
-                bits
+                // Bits are normally pre-allocated by `declare_var`; allocate on demand only if a
+                // variable reaches the blaster without that (keeps `encode` usable on its own).
+                match self.var_bits.get(id) {
+                    Some(bits) => bits.clone(),
+                    None => {
+                        let bits: Vec<i32> = (0..w).map(|_| self.cnf.new_var()).collect();
+                        self.var_bits.insert(*id, bits.clone());
+                        bits
+                    }
+                }
             }
             Node::Not(a) => self.encode(a).iter().map(|&l| -l).collect(),
             Node::Neg(a) => {

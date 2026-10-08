@@ -279,6 +279,11 @@ impl Solver {
         // `Model` we hand back copies its bits out, so it never borrows the arena.
         let bump = bumpalo::Bump::new();
         let mut b = Blaster::new(&bump);
+        // Every declared variable gets its SAT bits up front, so a model is total over the
+        // declaration: `Model::get` reads back a variable no constraint happened to mention.
+        for (id, (_, width)) in self.vars.iter().enumerate() {
+            b.declare_var(id, *width);
+        }
         for c in constraints {
             b.assert_true(c);
         }
@@ -307,9 +312,10 @@ impl Solver {
 
 /// A satisfying assignment, queryable by variable name.
 ///
-/// Only [`Solution::Sat`] carries one. The assignment is total - every variable the solver
-/// knows about has a value here, whether or not a given constraint mentioned it - but
-/// [`get`](Model::get) reports only the variables this model was actually built with.
+/// Only [`Solution::Sat`] carries one. The assignment is total over the variables declared on
+/// the [`Solver`]: [`get`](Model::get) reads back any declared variable, whether or not a
+/// constraint mentioned it, so a query that constrains only some of the declared variables
+/// still hands back a value for every one.
 #[derive(Debug)]
 pub struct Model {
     assignment: Vec<bool>,
@@ -443,5 +449,32 @@ mod tests {
             c.wrapping_mul(0x10) & 0xffff_ffff < 0x10,
             "count={c} should overflow"
         );
+    }
+
+    #[test]
+    fn test_unused_variable_still_reads_back() {
+        // The model is total over the declaration: a variable no constraint mentions is still
+        // assigned, so `get` returns a value rather than the `None` that means "never declared".
+        let mut s = Solver::new();
+        let x = s.var("x", 8);
+        let _unused = s.var("unused", 16);
+        s.assert(x.eq(&Bv::val(5, 8)));
+
+        let m = sat(&s);
+        assert_eq!(m.get("x"), Some(5));
+        let u = m.get("unused").expect("a declared variable reads back");
+        assert!(u <= 0xffff, "unused value {u} exceeds its 16-bit width");
+    }
+
+    #[test]
+    fn test_variables_read_back_with_no_constraints() {
+        // Even an empty constraint set yields a total model over the declared variables.
+        let mut s = Solver::new();
+        let _a = s.var("a", 1);
+        let _b = s.var("b", 64);
+
+        let m = sat(&s);
+        assert!(m.get("a").is_some());
+        assert!(m.get("b").is_some());
     }
 }
