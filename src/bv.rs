@@ -62,7 +62,10 @@ pub struct Bv(pub(crate) Rc<Node>);
 
 impl Bv {
     pub(crate) fn wrap(n: Node) -> Bv {
-        Bv(Rc::new(n))
+        match fold(&n) {
+            Some(folded) => folded,
+            None => Bv(Rc::new(n)),
+        }
     }
 
     /// Do these two handles point at the SAME shared expression node? A cheap, recursion-free
@@ -77,18 +80,27 @@ impl Bv {
     /// The width of this value in bits.
     #[must_use]
     pub fn width(&self) -> u32 {
-        match &*self.0 {
-            Node::Const(w, _) | Node::Var(w, _) => *w,
-            Node::Not(a) | Node::Neg(a) | Node::Bin(_, a, _) => a.width(),
-            Node::ShlC(a, _) | Node::ShrC(a, _, _) => a.width(),
-            Node::ShlV(a, _) | Node::ShrV(a, _, _) | Node::RotC(a, _, _) | Node::RotV(a, _, _) => {
-                a.width()
+        // Iterative: width descends the left spine for the value-carrying nodes, so a deep chain
+        // (a shift applied a hundred thousand times, say) reports its width without recursing.
+        let mut node = &*self.0;
+        loop {
+            match node {
+                Node::Const(w, _) | Node::Var(w, _) => return *w,
+                Node::Not(a)
+                | Node::Neg(a)
+                | Node::Bin(_, a, _)
+                | Node::ShlC(a, _)
+                | Node::ShrC(a, _, _)
+                | Node::ShlV(a, _)
+                | Node::ShrV(a, _, _)
+                | Node::RotC(a, _, _)
+                | Node::RotV(a, _, _) => node = &*a.0,
+                Node::Compare(_, _, _) => return 1,
+                Node::Zext(_, w) | Node::Sext(_, w) => return *w,
+                Node::Extract(_, hi, lo) => return hi - lo + 1,
+                Node::Concat(a, b) => return a.width() + b.width(),
+                Node::Ite(_, a, _) => return a.width(),
             }
-            Node::Compare(_, _, _) => 1,
-            Node::Zext(_, w) | Node::Sext(_, w) => *w,
-            Node::Extract(_, hi, lo) => hi - lo + 1,
-            Node::Concat(a, b) => a.width() + b.width(),
-            Node::Ite(_, a, _) => a.width(),
         }
     }
 
@@ -107,11 +119,11 @@ impl Bv {
         Bv::wrap(Node::Const(w, mask(v, w)))
     }
 
-    /// The value as a plain number, if this handle *is* a constant rather than an expression.
+    /// The value as a plain number, if this handle *is* a constant.
     ///
-    /// Most handles built from operations return `None` here however obvious their value
-    /// looks: nothing folds `Bv::val(1, 8).add(&Bv::val(1, 8))` down to `2`. Reach for
-    /// [`ptr_eq`](Bv::ptr_eq) or the solver when the distinction matters.
+    /// Constant expressions fold on construction, so this answers more often than "is this
+    /// handle a `val`": `Bv::val(1, 8).add(&Bv::val(1, 8))` is already the constant `2`. An
+    /// expression that mentions a variable still returns `None` here.
     #[must_use]
     pub fn as_const(&self) -> Option<u64> {
         if let Node::Const(_, v) = &*self.0 {
@@ -594,6 +606,431 @@ pub fn mask(v: u64, w: u32) -> u64 {
     if w >= 64 { v } else { v & ((1u64 << w) - 1) }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Simplification. Every combinator routes through `Bv::wrap`, so folding here - before the node
+// is `Rc`-shared - means a constant expression is one node and a rewrite that returns an existing
+// child keeps that child's identity, which is what the blaster's memoisation keys on.
+// ---------------------------------------------------------------------------------------------
+
+/// Reduce `n` to a constant or to an existing child, if it obviously is one. Returns `None` when
+/// the node stands as built. Never recurses into children: it only peeks at the immediate
+/// operands, so a deep chain costs one node's work here.
+fn fold(n: &Node) -> Option<Bv> {
+    match n {
+        Node::Const(_, _) | Node::Var(_, _) => None,
+        Node::Not(a) => {
+            if let Some(v) = a.as_const() {
+                return Some(const_of(a.width(), mask(!v, a.width())));
+            }
+            if let Node::Not(b) = &*a.0 {
+                return Some(b.clone());
+            }
+            None
+        }
+        Node::Neg(a) => {
+            if let Some(v) = a.as_const() {
+                return Some(const_of(a.width(), mask(0u64.wrapping_sub(v), a.width())));
+            }
+            if let Node::Neg(b) = &*a.0 {
+                return Some(b.clone());
+            }
+            None
+        }
+        Node::Bin(op, a, b) => fold_bin(*op, a, b),
+        Node::ShlC(a, k) => {
+            if let Some(v) = a.as_const() {
+                return Some(const_of(a.width(), shl_(v, u64::from(*k), a.width())));
+            }
+            if *k == 0 {
+                return Some(a.clone());
+            }
+            None
+        }
+        Node::ShrC(a, k, arith) => {
+            if let Some(v) = a.as_const() {
+                let w = a.width();
+                return Some(const_of(w, shr_(v, u64::from(*k), w, *arith)));
+            }
+            if *k == 0 {
+                return Some(a.clone());
+            }
+            None
+        }
+        Node::ShlV(a, k) => {
+            if let Some(kv) = k.as_const() {
+                if let Some(v) = a.as_const() {
+                    return Some(const_of(a.width(), shl_(v, kv, a.width())));
+                }
+                if kv == 0 {
+                    return Some(a.clone());
+                }
+            }
+            None
+        }
+        Node::ShrV(a, k, arith) => {
+            if let Some(kv) = k.as_const() {
+                if let Some(v) = a.as_const() {
+                    let w = a.width();
+                    return Some(const_of(w, shr_(v, kv, w, *arith)));
+                }
+                if kv == 0 {
+                    return Some(a.clone());
+                }
+            }
+            None
+        }
+        Node::RotC(a, k, left) => {
+            if let Some(v) = a.as_const() {
+                let w = a.width();
+                return Some(const_of(w, rot_(v, u64::from(*k), w, *left)));
+            }
+            if *k == 0 {
+                return Some(a.clone());
+            }
+            None
+        }
+        Node::RotV(a, k, left) => {
+            if let Some(kv) = k.as_const() {
+                if let Some(v) = a.as_const() {
+                    let w = a.width();
+                    return Some(const_of(w, rot_(v, kv, w, *left)));
+                }
+                if kv == 0 {
+                    return Some(a.clone());
+                }
+            }
+            None
+        }
+        Node::Compare(c, a, b) => fold_cmp(*c, a, b),
+        Node::Zext(a, w) => {
+            if let Some(v) = a.as_const() {
+                return Some(const_of(*w, v));
+            }
+            if *w == a.width() {
+                return Some(a.clone());
+            }
+            None
+        }
+        Node::Sext(a, w) => {
+            if let Some(v) = a.as_const() {
+                return Some(const_of(*w, mask(signed(v, a.width()) as u64, *w)));
+            }
+            if *w == a.width() {
+                return Some(a.clone());
+            }
+            None
+        }
+        Node::Extract(a, hi, lo) => {
+            if let Some(v) = a.as_const() {
+                return Some(const_of(*hi - *lo + 1, mask(v >> *lo, *hi - *lo + 1)));
+            }
+            if *lo == 0 && *hi == a.width() - 1 {
+                return Some(a.clone());
+            }
+            None
+        }
+        Node::Concat(a, b) => {
+            if let (Some(x), Some(y)) = (a.as_const(), b.as_const()) {
+                let w = a.width() + b.width();
+                return Some(const_of(w, mask((x << b.width()) | y, w)));
+            }
+            None
+        }
+        Node::Ite(c, a, b) => {
+            if a.ptr_eq(b) {
+                return Some(a.clone());
+            }
+            if let Some(cv) = c.as_const() {
+                return Some(if cv != 0 { a.clone() } else { b.clone() });
+            }
+            None
+        }
+    }
+}
+
+/// Fold a binary op: both operands constant, one operand an identity, or an operand repeated.
+fn fold_bin(op: Op, a: &Bv, b: &Bv) -> Option<Bv> {
+    let w = a.width();
+    if let (Some(x), Some(y)) = (a.as_const(), b.as_const()) {
+        return Some(const_of(w, eval_bin(op, x, y, w)));
+    }
+    let all = mask(u64::MAX, w);
+    match op {
+        Op::Add => {
+            if a.as_const() == Some(0) {
+                return Some(b.clone());
+            }
+            if b.as_const() == Some(0) {
+                return Some(a.clone());
+            }
+        }
+        Op::Sub => {
+            if a.ptr_eq(b) {
+                return Some(const_of(w, 0));
+            }
+            if b.as_const() == Some(0) {
+                return Some(a.clone());
+            }
+        }
+        Op::Mul => {
+            if a.as_const() == Some(0) || b.as_const() == Some(0) {
+                return Some(const_of(w, 0));
+            }
+            if a.as_const() == Some(1) {
+                return Some(b.clone());
+            }
+            if b.as_const() == Some(1) {
+                return Some(a.clone());
+            }
+        }
+        Op::And => {
+            if a.ptr_eq(b) {
+                return Some(a.clone());
+            }
+            if a.as_const() == Some(0) || b.as_const() == Some(0) {
+                return Some(const_of(w, 0));
+            }
+            if a.as_const() == Some(all) {
+                return Some(b.clone());
+            }
+            if b.as_const() == Some(all) {
+                return Some(a.clone());
+            }
+        }
+        Op::Or => {
+            if a.ptr_eq(b) {
+                return Some(a.clone());
+            }
+            if a.as_const() == Some(0) {
+                return Some(b.clone());
+            }
+            if b.as_const() == Some(0) {
+                return Some(a.clone());
+            }
+            if a.as_const() == Some(all) || b.as_const() == Some(all) {
+                return Some(const_of(w, all));
+            }
+        }
+        Op::Xor => {
+            if a.ptr_eq(b) {
+                return Some(const_of(w, 0));
+            }
+            if a.as_const() == Some(0) {
+                return Some(b.clone());
+            }
+            if b.as_const() == Some(0) {
+                return Some(a.clone());
+            }
+            if a.as_const() == Some(all) {
+                return Some(b.not());
+            }
+            if b.as_const() == Some(all) {
+                return Some(a.not());
+            }
+        }
+        Op::Udiv => {
+            if b.as_const() == Some(1) {
+                return Some(a.clone());
+            }
+            if b.as_const() == Some(0) {
+                return Some(const_of(w, all));
+            }
+        }
+        Op::Urem => {
+            if a.ptr_eq(b) {
+                return Some(const_of(w, 0));
+            }
+            if b.as_const() == Some(1) {
+                return Some(const_of(w, 0));
+            }
+            if b.as_const() == Some(0) {
+                return Some(a.clone());
+            }
+        }
+        Op::Sdiv => {
+            if b.as_const() == Some(1) {
+                return Some(a.clone());
+            }
+        }
+        Op::Srem => {
+            if a.ptr_eq(b) {
+                return Some(const_of(w, 0));
+            }
+            if b.as_const() == Some(1) {
+                return Some(const_of(w, 0));
+            }
+            if b.as_const() == Some(0) {
+                return Some(a.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Fold a comparison: both operands constant, a value compared with itself, or a symmetric
+/// operation compared against its commuted twin (`a + b == b + a`).
+fn fold_cmp(c: Cmp, a: &Bv, b: &Bv) -> Option<Bv> {
+    if let (Some(x), Some(y)) = (a.as_const(), b.as_const()) {
+        let w = a.width();
+        let bit = match c {
+            Cmp::Eq => x == y,
+            Cmp::Ne => x != y,
+            Cmp::Ult => x < y,
+            Cmp::Ule => x <= y,
+            Cmp::Slt => signed(x, w) < signed(y, w),
+            Cmp::Sle => signed(x, w) <= signed(y, w),
+        };
+        return Some(const_of(1, u64::from(bit)));
+    }
+    if a.ptr_eq(b) {
+        return Some(const_of(
+            1,
+            match c {
+                Cmp::Eq | Cmp::Ule | Cmp::Sle => 1,
+                Cmp::Ne | Cmp::Ult | Cmp::Slt => 0,
+            },
+        ));
+    }
+    if matches!(c, Cmp::Eq | Cmp::Ne) {
+        if let (Node::Bin(op1, p, q), Node::Bin(op2, r, s)) = (&*a.0, &*b.0) {
+            if op1 == op2
+                && is_commutative(*op1)
+                && ((p.ptr_eq(r) && q.ptr_eq(s)) || (p.ptr_eq(s) && q.ptr_eq(r)))
+            {
+                return Some(const_of(1, u64::from(c == Cmp::Eq)));
+            }
+        }
+    }
+    None
+}
+
+fn is_commutative(op: Op) -> bool {
+    matches!(op, Op::And | Op::Or | Op::Xor | Op::Add | Op::Mul)
+}
+
+/// A fresh constant node, value masked to `w`. Bypasses `wrap` so folding cannot recurse.
+fn const_of(w: u32, v: u64) -> Bv {
+    Bv(Rc::new(Node::Const(w, mask(v, w))))
+}
+
+fn eval_bin(op: Op, x: u64, y: u64, w: u32) -> u64 {
+    match op {
+        Op::And => mask(x & y, w),
+        Op::Or => mask(x | y, w),
+        Op::Xor => mask(x ^ y, w),
+        Op::Add => mask(x.wrapping_add(y), w),
+        Op::Sub => mask(x.wrapping_sub(y), w),
+        Op::Mul => mask(x.wrapping_mul(y), w),
+        Op::Udiv => udiv_(x, y, w),
+        Op::Urem => urem_(x, y, w),
+        Op::Sdiv => sdiv_(x, y, w),
+        Op::Srem => srem_(x, y, w),
+    }
+}
+
+/// The `w`-bit two's-complement value of `x`, as a signed integer.
+fn signed(x: u64, w: u32) -> i128 {
+    let x = mask(x, w);
+    if (x >> (w - 1)) & 1 == 1 {
+        x as i128 - (1i128 << w)
+    } else {
+        x as i128
+    }
+}
+
+fn shl_(x: u64, k: u64, w: u32) -> u64 {
+    if k >= u64::from(w) {
+        0
+    } else {
+        mask(x << k, w)
+    }
+}
+
+fn lshr_(x: u64, k: u64, w: u32) -> u64 {
+    if k >= u64::from(w) {
+        0
+    } else {
+        mask(x, w) >> k
+    }
+}
+
+fn ashr_(x: u64, k: u64, w: u32) -> u64 {
+    let x = mask(x, w);
+    if k >= u64::from(w) {
+        if (x >> (w - 1)) & 1 == 1 {
+            mask(u64::MAX, w)
+        } else {
+            0
+        }
+    } else {
+        mask((signed(x, w) >> k) as u64, w)
+    }
+}
+
+fn shr_(x: u64, k: u64, w: u32, arith: bool) -> u64 {
+    if arith {
+        ashr_(x, k, w)
+    } else {
+        lshr_(x, k, w)
+    }
+}
+
+fn rotl_(x: u64, k: u64, w: u32) -> u64 {
+    let x = mask(x, w);
+    let k = (k % u64::from(w)) as u32;
+    if k == 0 {
+        x
+    } else {
+        mask((x << k) | (x >> (w - k)), w)
+    }
+}
+
+fn rotr_(x: u64, k: u64, w: u32) -> u64 {
+    let x = mask(x, w);
+    let k = (k % u64::from(w)) as u32;
+    if k == 0 {
+        x
+    } else {
+        mask((x >> k) | (x << (w - k)), w)
+    }
+}
+
+fn rot_(x: u64, k: u64, w: u32, left: bool) -> u64 {
+    if left { rotl_(x, k, w) } else { rotr_(x, k, w) }
+}
+
+fn udiv_(x: u64, y: u64, w: u32) -> u64 {
+    x.checked_div(y).unwrap_or_else(|| mask(u64::MAX, w))
+}
+
+fn urem_(x: u64, y: u64, _w: u32) -> u64 {
+    x.checked_rem(y).unwrap_or(x)
+}
+
+fn sdiv_(x: u64, y: u64, w: u32) -> u64 {
+    let (a, b) = (signed(x, w), signed(y, w));
+    // `a` and `b` sit in [-2^63, 2^63-1], so `checked_div` is `None` exactly when the divisor is
+    // zero - the `MIN / -1` overflow cannot arise at these widths.
+    match a.checked_div(b) {
+        Some(q) => mask(q as u64, w),
+        None => {
+            if a >= 0 {
+                mask(u64::MAX, w)
+            } else {
+                1
+            }
+        }
+    }
+}
+
+fn srem_(x: u64, y: u64, w: u32) -> u64 {
+    let (a, b) = (signed(x, w), signed(y, w));
+    match a.checked_rem(b) {
+        Some(r) => mask(r as u64, w),
+        None => mask(x, w),
+    }
+}
+
 impl fmt::Debug for Bv {
     // `Display`'s s-expression, wrapped so a debug print can tell the two apart.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -656,5 +1093,79 @@ impl fmt::Display for Bv {
             Node::Concat(a, b) => write!(f, "(cat {a} {b})"),
             Node::Ite(c, a, b) => write!(f, "(ite {c} {a} {b})"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn var(w: u32) -> Bv {
+        Bv::wrap(Node::Var(w, 0))
+    }
+
+    #[test]
+    fn constant_arithmetic_folds() {
+        assert_eq!(Bv::val(1, 8).add(&Bv::val(1, 8)).as_const(), Some(2));
+        assert_eq!(Bv::val(250, 8).add(&Bv::val(10, 8)).as_const(), Some(4)); // wraps
+        assert_eq!(Bv::val(9, 8).udiv(&Bv::val(0, 8)).as_const(), Some(0xff));
+        assert_eq!(Bv::val(9, 8).urem(&Bv::val(0, 8)).as_const(), Some(9));
+        // Signed division by zero: all-ones for a non-negative dividend, 1 otherwise.
+        assert_eq!(Bv::val(9, 8).sdiv(&Bv::val(0, 8)).as_const(), Some(0xff));
+        assert_eq!(Bv::val(0x80, 8).sdiv(&Bv::val(0, 8)).as_const(), Some(1));
+        // Arithmetic shift of a negative value fills with ones.
+        assert_eq!(Bv::val(0x80, 8).ashr(2).as_const(), Some(0xe0));
+        // Comparison of constants.
+        assert_eq!(Bv::val(3, 8).ult(&Bv::val(4, 8)).as_const(), Some(1));
+        assert_eq!(Bv::val(3, 8).slt(&Bv::val(0xff, 8)).as_const(), Some(0)); // 3 < -1 is false
+    }
+
+    #[test]
+    fn identities_return_the_existing_child() {
+        let x = var(8);
+        assert!(x.add(&Bv::val(0, 8)).ptr_eq(&x));
+        assert!(Bv::val(0, 8).add(&x).ptr_eq(&x));
+        assert!(x.sub(&Bv::val(0, 8)).ptr_eq(&x));
+        assert!(x.mul(&Bv::val(1, 8)).ptr_eq(&x));
+        assert!(x.and(&Bv::val(0xff, 8)).ptr_eq(&x));
+        assert!(x.or(&Bv::val(0, 8)).ptr_eq(&x));
+        assert!(x.xor(&Bv::val(0, 8)).ptr_eq(&x));
+        assert!(x.shl(0).ptr_eq(&x));
+        assert!(x.rotl(0).ptr_eq(&x));
+        assert!(x.neg().neg().ptr_eq(&x));
+        assert!(x.not().not().ptr_eq(&x));
+    }
+
+    #[test]
+    fn identities_return_constants() {
+        let x = var(8);
+        assert_eq!(x.sub(&x).as_const(), Some(0));
+        assert_eq!(x.xor(&x).as_const(), Some(0));
+        assert_eq!(x.mul(&Bv::val(0, 8)).as_const(), Some(0));
+        assert_eq!(x.and(&Bv::val(0, 8)).as_const(), Some(0));
+        assert_eq!(x.or(&Bv::val(0xff, 8)).as_const(), Some(0xff));
+        assert_eq!(x.udiv(&Bv::val(0, 8)).as_const(), Some(0xff));
+        assert_eq!(x.urem(&Bv::val(1, 8)).as_const(), Some(0));
+    }
+
+    #[test]
+    fn a_value_compared_with_itself_folds() {
+        let x = var(8);
+        assert_eq!(x.eq(&x).as_const(), Some(1));
+        assert_eq!(x.ne(&x).as_const(), Some(0));
+        assert_eq!(x.ult(&x).as_const(), Some(0));
+        assert_eq!(x.ule(&x).as_const(), Some(1));
+        assert_eq!(x.slt(&x).as_const(), Some(0));
+        assert_eq!(x.sle(&x).as_const(), Some(1));
+    }
+
+    #[test]
+    fn a_symmetric_operation_equals_its_commuted_twin() {
+        let a = var(8);
+        let b = var(8);
+        assert_eq!(a.add(&b).eq(&b.add(&a)).as_const(), Some(1));
+        assert_eq!(a.mul(&b).eq(&b.mul(&a)).as_const(), Some(1));
+        assert_eq!(a.and(&b).eq(&b.and(&a)).as_const(), Some(1));
+        assert_eq!(a.add(&b).ne(&b.add(&a)).as_const(), Some(0));
     }
 }

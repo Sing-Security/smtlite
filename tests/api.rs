@@ -159,8 +159,11 @@ fn var_ids_walks_a_deep_chain_without_overflowing_the_stack() {
     let mut s = Solver::new();
     let v = s.var("v", 8);
     let mut deep = v;
+    // `shl` rather than `not`: the simplifier collapses `~~x` to `x`, so a `not` chain would
+    // never grow. A constant shift is left as built and costs no width assert, so the chain stays
+    // deep and each step is O(1).
     for _ in 0..100_000 {
-        deep = deep.not();
+        deep = deep.shl(1);
     }
     // The walk is iterative, so a chain this deep must not blow the stack.
     assert_eq!(deep.var_ids(), vec![0]);
@@ -191,10 +194,17 @@ fn ptr_eq_is_identity_not_structure() {
 }
 
 #[test]
-fn as_const_is_only_for_literal_constants() {
+fn as_const_folds_constant_expressions() {
     assert_eq!(Bv::val(7, 8).as_const(), Some(7));
     assert_eq!(Bv::val(0x1ff, 8).as_const(), Some(0xff)); // masked to width on construction
-    assert_eq!(Bv::val(1, 8).add(&Bv::val(1, 8)).as_const(), None);
+    // A constant expression folds on construction, so it reads back as a constant.
+    assert_eq!(Bv::val(1, 8).add(&Bv::val(1, 8)).as_const(), Some(2));
+    // Folding follows SMT-LIB zero-divisor semantics, not Rust's divide-by-zero panic.
+    assert_eq!(Bv::val(9, 8).udiv(&Bv::val(0, 8)).as_const(), Some(0xff));
+    // A rewrite that keeps a variable keeps returning `None`, as a variable is not a constant.
+    let mut s = Solver::new();
+    let x = s.var("x", 8);
+    assert_eq!(x.add(&Bv::val(0, 8)).as_const(), None);
 }
 
 #[test]

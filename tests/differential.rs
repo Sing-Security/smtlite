@@ -15,8 +15,8 @@
 //!   `E != w` UNSAT - at every width, over every operation.
 //! - **Metamorphic** (`metamorphic_*`): identities that hold for every assignment, checked by
 //!   refuting their negation.
-//! - **Budget boundary** (`adder_equivalence_degrades_to_unknown_not_a_wrong_verdict`): where the
-//!   search cannot close, it answers `Unknown` rather than inventing a model.
+//! - **Budget boundary** (`adder_associativity_degrades_to_unknown_not_a_wrong_verdict`): where
+//!   the search cannot close, it answers `Unknown` rather than inventing a model.
 //!
 //! Generation is seeded: a failure reproduces exactly, and the generator covers every operation
 //! the crate exposes, including the width-changing ones.
@@ -553,7 +553,7 @@ fn gen_expr(rng: &mut Rng, depth: u32, w: u32) -> E {
 /// out: the sweep's queries are refutations (`e == c` UNSAT for every unreachable `c`), and
 /// refuting a multiplier or divider equality is the case this solver cannot close inside the
 /// budget. Those operators are covered by `pinned_differential_all_ops`, whose queries are
-/// satisfiable, and by `adder_equivalence_degrades_to_unknown_not_a_wrong_verdict`.
+/// satisfiable, and by `adder_associativity_degrades_to_unknown_not_a_wrong_verdict`.
 const OPS_WP: [Op2; 5] = [Op2::And, Op2::Or, Op2::Xor, Op2::Add, Op2::Sub];
 
 /// A random expression of width `w` built only from width-preserving operations, so the whole
@@ -790,14 +790,15 @@ fn tautology(s: &Solver, constraint: Bv, what: &str) {
 
 #[test]
 fn metamorphic_algebraic_identities() {
-    // Width 4: refuting an identity's negation costs what the circuit costs, and these become
-    // adder- and multiplier-equivalence at width 16, past what this solver closes (see
-    // `adder_equivalence_degrades_to_unknown_not_a_wrong_verdict`).
+    // Width 4: refuting an identity's negation costs what the circuit costs. Commutativity of
+    // the symmetric operations folds to a constant now, so the checks below that still reach the
+    // blaster - sub-vs-neg, De Morgan, comparison mirrors - carry the weight. Reassociation is
+    // the hard adder case; see `adder_associativity_degrades_to_unknown_not_a_wrong_verdict`.
     let mut s = Solver::new();
     let a = s.var("a", 4);
     let b = s.var("b", 4);
 
-    // Commutativity of the symmetric operations.
+    // Commutativity of the symmetric operations, folded by construction.
     tautology(&s, a.add(&b).eq(&b.add(&a)), "a + b == b + a");
     tautology(&s, a.mul(&b).eq(&b.mul(&a)), "a * b == b * a");
     tautology(&s, a.and(&b).eq(&b.and(&a)), "a & b == b & a");
@@ -903,16 +904,18 @@ fn metamorphic_extension_and_extraction() {
 }
 
 #[test]
-fn adder_equivalence_degrades_to_unknown_not_a_wrong_verdict() {
-    // `a + b == b + a` is a tautology, so its negation is unsatisfiable at every width. Refuting
-    // it is adder equivalence, which a DPLL core without clause learning cannot close once the
-    // carries chain up. Whatever the budget does, the answer must never be `Sat`: there is no
-    // model of `a + b != b + a`.
+fn adder_associativity_degrades_to_unknown_not_a_wrong_verdict() {
+    // `(a + b) + c == a + (b + c)` is a tautology (wrapping addition is associative), so its
+    // negation is unsatisfiable at every width. The simplifier folds commutativity - `a + b ==
+    // b + a` becomes a constant - but not reassociation, so this stays a genuine adder
+    // equivalence that a DPLL core without clause learning cannot close once the carries chain
+    // up. Whatever the budget does, the answer must never be `Sat`.
     fn verdict(w: u32, budget: Option<u64>) -> Solution {
         let mut s = Solver::new();
         let a = s.var("a", w);
         let b = s.var("b", w);
-        let negated = a.add(&b).eq(&b.add(&a)).not();
+        let c = s.var("c", w);
+        let negated = a.add(&b).add(&c).eq(&a.add(&b.add(&c))).not();
         match budget {
             Some(n) => s.check_all_with_budget(&[negated], n),
             None => s.check_all(&[negated]),
@@ -922,7 +925,7 @@ fn adder_equivalence_degrades_to_unknown_not_a_wrong_verdict() {
     // Width 4 refutes inside the default budget.
     assert!(
         matches!(verdict(4, None), Solution::Unsat),
-        "width 4 should refute a + b == b + a inside the default budget"
+        "width 4 should refute (a + b) + c == a + (b + c) inside the default budget"
     );
 
     // Widths 16 and 32 under a small budget: `Unknown` is correct, `Sat` is not.
@@ -930,7 +933,9 @@ fn adder_equivalence_degrades_to_unknown_not_a_wrong_verdict() {
         match verdict(w, Some(10_000)) {
             Solution::Unsat => {}
             Solution::Unknown => {}
-            Solution::Sat(m) => panic!("width {w}: a + b == b + a reported SAT with {m:?}"),
+            Solution::Sat(m) => {
+                panic!("width {w}: (a + b) + c == a + (b + c) reported SAT with {m:?}")
+            }
         }
     }
 }
