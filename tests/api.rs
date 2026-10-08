@@ -70,12 +70,13 @@ fn zero_budget_refutes_by_propagation_but_cannot_branch() {
     s.assert(x.eq(&Bv::val(6, 8)));
     assert!(matches!(s.check_with_budget(0), Solution::Unsat));
 
-    // Satisfiable, but only after branching. `y | ~y` is a tautology that unit propagation cannot
-    // see through, so the solver has to decide `y` - and the first decision exceeds a zero budget.
+    // Satisfiable, but only after branching. `y | z` has no unit clause, so the solver has to
+    // decide one of them - and the first decision exceeds a zero budget.
     let mut t = Solver::new();
     let y = t.var("y", 1);
+    let z = t.var("z", 1);
     assert!(matches!(
-        t.check_all_with_budget(&[y.or(&y.not())], 0),
+        t.check_all_with_budget(&[y.or(&z)], 0),
         Solution::Unknown
     ));
 }

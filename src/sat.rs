@@ -15,7 +15,12 @@
 //! The solver does not branch on a variable that occurs in no clause. Such a variable is free, so
 //! any value satisfies the formula, and a [`crate::Solver`] allocates bits for every variable it
 //! declares - including ones no constraint mentions.
+//!
+//! Before the search, one assignment-free pass simplifies the clause set: a unit clause forces its
+//! literal, so clauses containing a forced literal are satisfied, the negation of a forced literal
+//! drops out of a clause, and duplicate and tautological clauses go.
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 /// A CNF formula: `nvars` boolean variables and a conjunction of clauses (each a disjunction
@@ -132,6 +137,71 @@ impl<'b> Cnf<'b> {
     }
 }
 
+/// One assignment-free cleanup pass over the clause set, run before the search starts.
+///
+/// Unit clauses force their literal, and that is the whole simplification:
+/// - a clause containing a forced literal is already satisfied and goes;
+/// - the negation of a forced literal can never satisfy a clause and drops out of it;
+/// - a clause holding both a literal and its negation is always true and goes;
+/// - duplicate clauses go (one copy per canonical form survives).
+///
+/// A clause whose literals all drop out is the empty clause: the formula is unsatisfiable, which
+/// is reported as `None`. Nothing is assigned here, so the free-variable filter and model
+/// readback see exactly the formula the caller built. The unit clauses themselves are kept, so
+/// the forced values survive as seed assignments for the search.
+fn preprocess(clauses: &[&[i32]], nvars: usize) -> Option<Vec<Vec<i32>>> {
+    // What does each unit clause force? A later unit clause overwrites an earlier one; the
+    // solver's own unit seeding rejects a conflicting pair, so either order is fine here.
+    let mut forced = vec![None; nvars];
+    for clause in clauses {
+        if clause.len() == 1 {
+            let lit = clause[0];
+            forced[(lit.unsigned_abs() - 1) as usize] = Some(lit > 0);
+        }
+    }
+
+    let mut out: Vec<Vec<i32>> = Vec::with_capacity(clauses.len());
+    let mut seen: HashSet<Vec<i32>> = HashSet::new();
+    for clause in clauses {
+        let mut kept: Vec<i32> = Vec::with_capacity(clause.len());
+        let mut satisfied = false;
+        let mut tautology = false;
+        for &lit in clause.iter() {
+            let v = (lit.unsigned_abs() - 1) as usize;
+            match forced[v] {
+                Some(want) if want == (lit > 0) => {
+                    if clause.len() == 1 {
+                        kept.push(lit); // the forcing unit clause must survive
+                    } else {
+                        satisfied = true; // a forced literal already satisfies the clause
+                        break;
+                    }
+                }
+                Some(_) => {} // forced false: the literal never helps, drop it
+                None => {
+                    if kept.contains(&-lit) {
+                        tautology = true; // x and -x in one clause: always true
+                    }
+                    kept.push(lit);
+                }
+            }
+        }
+        if satisfied || tautology {
+            continue;
+        }
+        if kept.is_empty() {
+            return None; // every literal was forced false: the empty clause
+        }
+        // Duplicates drop here: hash the sorted (canonical) form, first copy wins.
+        let mut key = kept.clone();
+        key.sort_unstable();
+        if seen.insert(key) {
+            out.push(kept);
+        }
+    }
+    Some(out)
+}
+
 /// Solve a CNF formula given as borrowed clauses, bounded by a decision budget and an optional
 /// wall-clock `deadline`.
 ///
@@ -158,6 +228,16 @@ pub fn solve(
     // The empty clause is the empty disjunction, i.e. false: unsatisfiable outright.
     if clauses.iter().any(|c| c.is_empty()) {
         return SatResult::Unsat;
+    }
+    // Simplify the clause set once, before any search state exists.
+    let Some(cleaned) = preprocess(clauses, nvars) else {
+        return SatResult::Unsat;
+    };
+    let cleaned: Vec<&[i32]> = cleaned.iter().map(Vec::as_slice).collect();
+    let clauses = cleaned.as_slice();
+    // The cleanup pass does not check the clock; do not let it eat the deadline silently.
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return SatResult::Unknown;
     }
 
     let n = nvars;
