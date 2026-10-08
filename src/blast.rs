@@ -315,7 +315,7 @@ impl<'b> Blaster<'b> {
     ///
     /// Each step shifts one dividend bit into a `w+1`-bit remainder and conditionally subtracts
     /// `b`. The carry-out of `rem + ¬b + 1` is exactly `rem >= b`, so a single adder per step
-    /// yields both the difference and the comparison — no separate comparator is needed.
+    /// yields both the difference and the comparison - no separate comparator is needed.
     ///
     /// A zero divisor needs no special case: `rem >= 0` always holds, so every quotient bit is 1
     /// (all-ones, SMT-LIB `bvudiv`) and the remainder ends up holding `a` (SMT-LIB `bvurem`).
@@ -328,7 +328,7 @@ impl<'b> Blaster<'b> {
         let mut quot = vec![self.f(); w];
         for i in (0..w).rev() {
             // Fold the next dividend bit in. Little-endian, so it is *less* significant than
-            // everything in `rem`: index 0, the rest slides up — `rem << 1 | a[i]` reversed.
+            // everything in `rem`: index 0, the rest slides up - `rem << 1 | a[i]` reversed.
             let mut shifted = Vec::with_capacity(w + 1);
             shifted.push(a[i]);
             shifted.extend_from_slice(&rem[0..w]);
@@ -360,7 +360,7 @@ impl<'b> Blaster<'b> {
         self.mux_vec(bzero, &on_zero, &quotient)
     }
 
-    /// Signed remainder, taking the sign of the **dividend** (SMT-LIB `bvsrem` — C's `%`).
+    /// Signed remainder, taking the sign of the **dividend** (SMT-LIB `bvsrem` - C's `%`).
     fn srem_bits(&mut self, a: &[i32], b: &[i32]) -> Vec<i32> {
         let w = a.len();
         let (aa, bb) = (self.abs_bits(a), self.abs_bits(b));
@@ -376,9 +376,9 @@ impl<'b> Blaster<'b> {
 
     // ---- Symbolic shifts and rotates ---------------------------------------------
 
-    /// Barrel shifter for a symbolic amount: `stages` conditionally shift by 1, 2, 4, …
+    /// Barrel shifter for a symbolic amount: `stages` conditionally shift by 1, 2, 4, ...
     ///
-    /// An amount at or beyond the width does **not** wrap — every bit takes the fill (zero for
+    /// An amount at or beyond the width does **not** wrap - every bit takes the fill (zero for
     /// `<<`/`>>u`, the sign bit for `>>s`), which is SMT-LIB shift semantics as opposed to a
     /// rotate's.
     fn shift_var_bits(&mut self, a: &[i32], k: &[i32], kind: ShKind) -> Vec<i32> {
@@ -524,7 +524,7 @@ fn shift_stages(w: usize) -> usize {
     stages
 }
 
-/// Rotate a bit vector by a constant amount — a pure re-indexing, costing no gates.
+/// Rotate a bit vector by a constant amount - a pure re-indexing, costing no gates.
 fn rot_const(a: &[i32], k: u32, left: bool) -> Vec<i32> {
     let w = a.len();
     let sh = (k as usize) % w;

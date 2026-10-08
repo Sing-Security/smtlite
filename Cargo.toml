@@ -1,9 +1,9 @@
-# smtlite — a small, pure-Rust QF_BV SMT solver.
+# smtlite - a small, pure-Rust QF_BV SMT solver.
 #
 # No external solver, no C, no `unsafe`: a bitvector expression DAG is bit-blasted to CNF and
 # handed to a self-contained DPLL SAT core, and a satisfying assignment is read back as concrete
-# bitvector values. Scoped to the DIRECTED, single-function queries a caller asks in bulk —
-# not general-purpose theorem proving — so it stays small and dependency-free.
+# bitvector values. Scoped to the DIRECTED, single-function queries a caller asks in bulk -
+# not general-purpose theorem proving - so it stays small and dependency-free.
 #
 # This manifest is deliberately self-contained (no `{ workspace = true }` fields), so the crate
 # builds and publishes identically whether it is pulled in as a dependency or checked out alone.
@@ -25,7 +25,7 @@ exclude = ["**/*.rs.bk"]
 
 [dependencies]
 # The sole dependency: a bump arena for the bit-blaster's per-solve CNF clauses (thousands of tiny,
-# same-lifetime allocations freed together). Pure Rust, no C — the crate's "no external solver, no C"
+# same-lifetime allocations freed together). Pure Rust, no C - the crate's "no external solver, no C"
 # principle holds; this is an allocator, not a solver.
 bumpalo = { version = "3", features = ["collections"] }
 

@@ -1,4 +1,4 @@
-//! smtlite — a small, pure-Rust QF_BV SMT solver.
+//! smtlite - a small, pure-Rust QF_BV SMT solver.
 //!
 //! Quantifier-free bitvector formulas only: build expressions with [`Solver::var`] and the
 //! [`Bv`] combinators, [`Solver::assert`] the 1-bit constraints, and call [`Solver::check`].
@@ -6,8 +6,8 @@
 //! alternative answers are `Unsat` and a budget-limited `Unknown`, and the three are kept
 //! distinct so a caller can tell a proof from a timeout ([`Solution`]).
 //!
-//! It is scoped to *directed* queries — "is there an input that makes this operation
-//! overflow?", "can this length reach that copy?" — asked many times over, rather than to
+//! It is scoped to *directed* queries - "is there an input that makes this operation
+//! overflow?", "can this length reach that copy?" - asked many times over, rather than to
 //! general theorem proving. See the README for what that costs and what it rules out.
 //!
 //! Under the hood the expression DAG is bit-blasted to CNF and solved by a self-contained
@@ -39,7 +39,7 @@
 //! operation whose result or target width would fall outside 1..=64 **panics**, as does one
 //! given two operands of different widths; each such method says so under `# Panics`.
 //!
-//! A [`Bv`] is an `Rc`-shared node, so neither [`Bv`] nor [`Solver`] is `Send` or `Sync` — one
+//! A [`Bv`] is an `Rc`-shared node, so neither [`Bv`] nor [`Solver`] is `Send` or `Sync` - one
 //! solve runs on one thread.
 #![cfg_attr(doctest, doc = include_str!("../README.md"))]
 
@@ -71,14 +71,14 @@ const DEFAULT_MAX_CLAUSES: usize = 40_000;
 ///
 /// The distinction that matters is [`Unknown`](Solution::Unknown) against the other two: `Sat`
 /// and `Unsat` are verdicts about the formula, while `Unknown` says only that a configured
-/// bound was reached first. Nothing may treat `Unknown` as "no solution exists" — it is the
+/// bound was reached first. Nothing may treat `Unknown` as "no solution exists" - it is the
 /// absence of an answer, not a negative one.
 #[derive(Debug)]
 pub enum Solution {
     /// Satisfiable. The [`Model`] holds a concrete assignment under which every asserted
     /// constraint holds simultaneously.
     Sat(Model),
-    /// Unsatisfiable — no assignment satisfies the constraints, proven within the bounds.
+    /// Unsatisfiable - no assignment satisfies the constraints, proven within the bounds.
     Unsat,
     /// No verdict: the decision budget, the wall-clock deadline, or the clause cap was reached
     /// before the search finished.
@@ -123,7 +123,7 @@ impl Solver {
     }
 
     /// Raise (or lower) the formula-size cap above which a query becomes [`Solution::Unknown`]
-    /// without being solved — see `DEFAULT_MAX_CLAUSES`. The default fits every operation at 32
+    /// without being solved - see `DEFAULT_MAX_CLAUSES`. The default fits every operation at 32
     /// bits; a 64-bit division needs roughly 110,000 clauses, and such a query should be paired
     /// with a wall-clock deadline via [`check_all_within`](Self::check_all_within).
     #[must_use]
@@ -156,8 +156,8 @@ impl Solver {
     /// Does `bv` reference any variable whose name starts with `prefix`?
     ///
     /// This is how a caller tells where a value came from without threading provenance
-    /// through every operation: name the variables by origin — one prefix for data read from
-    /// outside, another for values the caller started with — and ask which of them a
+    /// through every operation: name the variables by origin - one prefix for data read from
+    /// outside, another for values the caller started with - and ask which of them a
     /// subexpression actually depends on. Use [`ptr_eq`](Bv::ptr_eq) to ask whether two
     /// handles are the *same* value.
     ///
@@ -237,7 +237,7 @@ impl Solver {
     ///
     /// The constraints passed here are the whole formula: nothing previously
     /// [`assert`](Self::assert)ed takes part. That makes this the entry point for asking many
-    /// independent questions against one shared variable namespace — where each question
+    /// independent questions against one shared variable namespace - where each question
     /// carries its own set of constraints (one path's assumptions, say) and none of them
     /// should leak into the next.
     #[must_use]
@@ -307,8 +307,8 @@ impl Solver {
 
 /// A satisfying assignment, queryable by variable name.
 ///
-/// Only [`Solution::Sat`] carries one. The assignment is total — every variable the solver
-/// knows about has a value here, whether or not a given constraint mentioned it — but
+/// Only [`Solution::Sat`] carries one. The assignment is total - every variable the solver
+/// knows about has a value here, whether or not a given constraint mentioned it - but
 /// [`get`](Model::get) reports only the variables this model was actually built with.
 #[derive(Debug)]
 pub struct Model {
@@ -320,7 +320,7 @@ pub struct Model {
 impl Model {
     /// The concrete value of a variable, or `None` if the model has no such variable.
     ///
-    /// `None` means the name was never declared on the [`Solver`] that produced this model —
+    /// `None` means the name was never declared on the [`Solver`] that produced this model -
     /// not that the value is unknown. A declared variable always reads back, including one no
     /// constraint mentioned (the solver still assigns it a value).
     ///
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn test_multiply_by_const() {
-        // 2*x == 10 (mod 2^32) has two solutions (5 and 0x80000005) — check the property,
+        // 2*x == 10 (mod 2^32) has two solutions (5 and 0x80000005) - check the property,
         // not a specific root.
         let mut s = Solver::new();
         let x = s.var("x", 32);
@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn test_range_model() {
-        // 5 <u x <u 10  ⇒  a value strictly between.
+        // 5 <u x <u 10  ==>  a value strictly between.
         let mut s = Solver::new();
         let x = s.var("x", 32);
         s.assert(x.ugt(&Bv::val(5, 32)));

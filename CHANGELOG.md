@@ -7,21 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] - 2026-10-07
 
-First public release. Written for directed, single-function queries — "is there an input that
-makes this overflow?", "can this length reach that copy?" — asked many times over.
+First public release. Written for directed, single-function queries - "is there an input that
+makes this overflow?", "can this length reach that copy?" - asked many times over.
 
 ### Added
 
-- **`Solver`** — named bitvector variables (`var`), stored constraints (`assert`), and an
+- **`Solver`** - named bitvector variables (`var`), stored constraints (`assert`), and an
   explicit-constraint path (`check_all`) for a caller carrying per-path constraints against one
   shared variable namespace.
-- **`Bv`** — bitvector expression combinators:
+- **`Bv`** - bitvector expression combinators:
   - boolean `and`/`or`/`xor`/`not`/`land`;
   - arithmetic `add`/`sub`/`mul`/`neg`, all wraparound;
-  - division and remainder — unsigned `udiv`/`urem`, signed `sdiv`/`srem`, with SMT-LIB
+  - division and remainder - unsigned `udiv`/`urem`, signed `sdiv`/`srem`, with SMT-LIB
     zero-divisor semantics (`bvudiv` by zero is all-ones, `bvurem` by zero is the dividend,
     `bvsdiv` by zero is all-ones for a non-negative dividend and `1` otherwise). `srem` takes the
-    sign of the dividend — C's `%`, not `bvsmod`'s;
+    sign of the dividend - C's `%`, not `bvsmod`'s;
   - shifts `shl`/`lshr`/`ashr` by a constant amount and `shl_var`/`lshr_var`/`ashr_var` by a
     symbolic one; a shift at or past the width empties the value rather than wrapping;
   - rotates `rotl`/`rotr` by a constant and `rotl_var`/`rotr_var` by a symbolic amount, where a
@@ -29,19 +29,19 @@ makes this overflow?", "can this length reach that copy?" — asked many times o
   - comparison `eq`/`ne`/`ult`/`ule`/`ugt`/`uge`/`slt`/`sle`/`sgt`/`sge`;
   - width `zext`/`sext`/`extract`/`concat`, plus `ite`;
   - and `val`, `as_const`, `width`, `ptr_eq`.
-- **`Model`** — a satisfying assignment readable by variable name (`get`).
-- **Bit-blaster** — Tseitin-encoded operations, ripple-carry adders, comparison via the carry-out
+- **`Model`** - a satisfying assignment readable by variable name (`get`).
+- **Bit-blaster** - Tseitin-encoded operations, ripple-carry adders, comparison via the carry-out
   of `a + ¬b + 1`, restoring division, barrel shifters and rotators, memoised shared subgraphs
   (`Rc` identity), little-endian bits.
-- **SAT core** — iterative DPLL: unit propagation to a fixpoint with chronological branch-and-flip
+- **SAT core** - iterative DPLL: unit propagation to a fixpoint with chronological branch-and-flip
   backtracking.
-- **Bounded solving** — a decision budget, an optional wall-clock deadline (`check_all_within`),
+- **Bounded solving** - a decision budget, an optional wall-clock deadline (`check_all_within`),
   and a formula-size cap (`Solver::with_max_clauses`). All three degrade to `Solution::Unknown`
   rather than stalling the caller.
-- **`Solver::depends_on`** — does a value derive from any variable whose name starts with a
+- **`Solver::depends_on`** - does a value derive from any variable whose name starts with a
   given prefix? Name variables by where their data came from and this tells you which of those
   origins a subexpression actually depends on, without threading provenance by hand.
-- Arena-allocated CNF clauses via `bumpalo` — the crate's only dependency.
+- Arena-allocated CNF clauses via `bumpalo` - the crate's only dependency.
 - No `unsafe` (`unsafe_code = "forbid"`), no C, no external solver.
 - A conformance suite (`tests/ops.rs`) that checks every operation against Rust's native operators
   as an oracle: exhaustive at width 4, sampled at 8, edge cases at 32 and 64, with each result
@@ -49,14 +49,14 @@ makes this overflow?", "can this length reach that copy?" — asked many times o
 
 ### Notes
 
-- **Widths are 1..=64, and the boundary is enforced.** A formula that would cross it — a
+- **Widths are 1..=64, and the boundary is enforced.** A formula that would cross it - a
   variable or constant wider than 64, a concatenation past 64, operands of different widths
-  — panics rather than producing a wrong answer. Release builds included: a silently
+  - panics rather than producing a wrong answer. Release builds included: a silently
   mis-blasted formula is worse than a stopped caller. Every affected method documents this
   under `# Panics`.
 - **A model reads back through `u64`.** `Model::get` returns the concrete value of a named
   variable, or `None` if no such variable was declared.
-- `Bv` is an `Rc`-shared node, so `Bv` and `Solver` are neither `Send` nor `Sync` — solving is
+- `Bv` is an `Rc`-shared node, so `Bv` and `Solver` are neither `Send` nor `Sync` - solving is
   single-threaded by design.
 - Bit-blasting cost varies sharply by operation: bitwise/constant-shift/constant-rotate are linear,
   `mul` and `div` are quadratic in the width, symbolic shifts are `O(w log w)`. A 64-bit division

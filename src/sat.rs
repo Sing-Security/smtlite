@@ -8,10 +8,10 @@
 //! Not present: pure-literal elimination, watched literals, clause learning and
 //! non-chronological backjumping. The clause set is re-scanned to a fixpoint on every
 //! propagation pass, which is why a sweep passes a wall-clock deadline alongside the decision
-//! budget — see [`Cnf::solve_within`].
+//! budget - see [`Cnf::solve_within`].
 
 /// A CNF formula: `nvars` boolean variables and a conjunction of clauses (each a disjunction
-/// of literals). Clauses are allocated in a bump arena `'b` — a directed query produces thousands
+/// of literals). Clauses are allocated in a bump arena `'b` - a directed query produces thousands
 /// of tiny same-lifetime clauses, so arena-allocating them turns per-clause `malloc` into a pointer
 /// bump and frees the whole formula at once when the arena drops.
 pub struct Cnf<'b> {
@@ -31,7 +31,7 @@ pub enum SatResult {
     Sat(Vec<bool>),
     /// Proven unsatisfiable.
     Unsat,
-    /// The step budget was exhausted before a verdict — treat as "not proven either way".
+    /// The step budget was exhausted before a verdict - treat as "not proven either way".
     Unknown,
 }
 
@@ -49,7 +49,7 @@ impl<'b> Cnf<'b> {
     /// Allocate a fresh variable, returning its positive literal.
     ///
     /// Never reuses an id, and never unassigns one, so literals stay valid for the formula's
-    /// whole lifetime — which is what lets the blaster hand them around freely.
+    /// whole lifetime - which is what lets the blaster hand them around freely.
     pub fn new_var(&mut self) -> i32 {
         self.nvars += 1;
         self.nvars as i32 // literal for var (nvars-1) is +nvars
@@ -58,7 +58,7 @@ impl<'b> Cnf<'b> {
     /// Add a clause: the disjunction of `lits`.
     ///
     /// The literals are copied into the arena, so the slice need not outlive the call. An
-    /// empty clause is the empty disjunction — immediately false, and therefore the way to
+    /// empty clause is the empty disjunction - immediately false, and therefore the way to
     /// state "unsatisfiable" outright.
     pub fn add_clause(&mut self, lits: &[i32]) {
         self.clauses.push(self.bump.alloc_slice_copy(lits));
@@ -103,7 +103,7 @@ impl<'b> Cnf<'b> {
                     flipped[v] = false;
                 }
             } else {
-                // No conflict — pick the next unassigned variable to branch on.
+                // No conflict - pick the next unassigned variable to branch on.
                 match assign.iter().position(Option::is_none) {
                     None => {
                         return SatResult::Sat(assign.iter().map(|a| a.unwrap_or(false)).collect());
@@ -156,7 +156,7 @@ impl<'b> Cnf<'b> {
                     continue;
                 }
                 if unassigned == 0 {
-                    return true; // all literals false — conflict
+                    return true; // all literals false - conflict
                 }
                 if unassigned == 1 {
                     let lit = unit.unwrap_or(0);
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_sat_unit_chain() {
-        // (a) ∧ (¬a ∨ b) ∧ (¬b ∨ c)  ⇒  a=b=c=true.
+        // (a) ∧ (¬a ∨ b) ∧ (¬b ∨ c)  ==>  a=b=c=true.
         let bump = bumpalo::Bump::new();
         let mut cnf = Cnf::new(&bump);
         let (a, b, c) = (cnf.new_var(), cnf.new_var(), cnf.new_var());
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn test_sat_contradiction_is_unsat() {
-        // (a) ∧ (¬a)  ⇒  UNSAT.
+        // (a) ∧ (¬a)  ==>  UNSAT.
         let bump = bumpalo::Bump::new();
         let mut cnf = Cnf::new(&bump);
         let a = cnf.new_var();
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_sat_needs_a_decision() {
-        // (a ∨ b) with nothing forcing either — satisfiable by branching.
+        // (a ∨ b) with nothing forcing either - satisfiable by branching.
         let bump = bumpalo::Bump::new();
         let mut cnf = Cnf::new(&bump);
         let (a, b) = (cnf.new_var(), cnf.new_var());

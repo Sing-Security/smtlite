@@ -1,6 +1,6 @@
 //! The bitvector expression DAG ([`Bv`]) that callers build and the blaster lowers.
 //!
-//! Nodes are `Rc`-shared so a value used twice is one subgraph, not two — the blaster
+//! Nodes are `Rc`-shared so a value used twice is one subgraph, not two - the blaster
 //! memoises on the `Rc` pointer, so shared subexpressions are encoded once. Widths are in
 //! bits (1..=64); comparisons produce a 1-bit [`Bv`].
 //!
@@ -66,7 +66,7 @@ impl Bv {
     }
 
     /// Do these two handles point at the SAME shared expression node? A cheap, recursion-free
-    /// identity test — true when one value is reused (e.g. a size passed to both an allocator and a
+    /// identity test - true when one value is reused (e.g. a size passed to both an allocator and a
     /// copy). Weaker than semantic equality (two structurally-identical-but-separately-built values
     /// return `false`), but it never blasts a formula, so a caller can use it as a fast pre-check.
     #[must_use]
@@ -97,7 +97,7 @@ impl Bv {
     ///
     /// # Panics
     ///
-    /// Panics unless `w` is 1..=64 — see [`Solver::var`](crate::Solver::var).
+    /// Panics unless `w` is 1..=64 - see [`Solver::var`](crate::Solver::var).
     #[must_use]
     pub fn val(v: u64, w: u32) -> Bv {
         assert!(
@@ -183,7 +183,7 @@ impl Bv {
     ///
     /// # Panics
     ///
-    /// Panics if `o` has a different width — see the [crate-level note](crate#width-and-threading-limits).
+    /// Panics if `o` has a different width - see the [crate-level note](crate#width-and-threading-limits).
     #[must_use]
     pub fn and(&self, o: &Bv) -> Bv {
         self.bin(Op::And, o)
@@ -274,7 +274,7 @@ impl Bv {
         self.bin(Op::Sdiv, o)
     }
 
-    /// Signed remainder taking the sign of the **dividend** — this is C's `%` and Rust's `%`
+    /// Signed remainder taking the sign of the **dividend** - this is C's `%` and Rust's `%`
     /// (SMT-LIB `bvsrem`, *not* `bvsmod`, which takes the sign of the divisor). A zero divisor
     /// yields the dividend.
     ///
@@ -320,7 +320,7 @@ impl Bv {
     }
 
     /// Shift left by a **symbolic** amount. `k` may be any width; when its value is at least
-    /// this value's width the result is zero (SMT-LIB `bvshl` — a shift is *not* a rotate).
+    /// this value's width the result is zero (SMT-LIB `bvshl` - a shift is *not* a rotate).
     #[must_use]
     pub fn shl_var(&self, k: &Bv) -> Bv {
         Bv::wrap(Node::ShlV(self.clone(), k.clone()))
@@ -348,7 +348,7 @@ impl Bv {
         Bv::wrap(Node::RotC(self.clone(), k, false))
     }
     /// Rotate left by a symbolic amount. A rotate is periodic in the width, so the amount is
-    /// reduced modulo the width — which for a non-power-of-two width costs a division.
+    /// reduced modulo the width - which for a non-power-of-two width costs a division.
     #[must_use]
     pub fn rotl_var(&self, k: &Bv) -> Bv {
         Bv::wrap(Node::RotV(self.clone(), k.clone(), true))
@@ -562,7 +562,7 @@ impl Bv {
         Bv::wrap(Node::Ite(cond.clone(), then.clone(), els.clone()))
     }
 
-    /// Logical AND of two 1-bit values — the readable way to conjoin constraints
+    /// Logical AND of two 1-bit values - the readable way to conjoin constraints
     /// ([`and`](Bv::and) does the same thing, but does not check that its operands really are
     /// propositions).
     ///

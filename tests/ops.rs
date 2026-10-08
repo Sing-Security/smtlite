@@ -8,14 +8,14 @@
 //! Integers here are width-`w` two's-complement bitvectors. `u64` values must be pre-masked to `w`
 //! bits; a test that feeds an unmasked value is testing the test.
 
-// The oracle writes the zero-divisor case out as `if b == 0 { … } else { a / b }` rather than
+// The oracle writes the zero-divisor case out as `if b == 0 { ... } else { a / b }` rather than
 // calling `checked_div`, which would hide the semantics under test: `bvudiv` by zero is all-ones
 // and `bvurem` by zero is the dividend.
 #![allow(clippy::manual_checked_ops)]
 
 use smtlite::{Bv, Solution, Solver};
 
-/// Formula-size cap for the 64-bit division cases — a 64-bit divider blasts to ~110,000 clauses,
+/// Formula-size cap for the 64-bit division cases - a 64-bit divider blasts to ~110,000 clauses,
 /// well over the crate's deliberate 40,000 default.
 const BIG: usize = 200_000;
 
@@ -182,7 +182,7 @@ fn sdiv_srem_edges_width8() {
         (0xff, 0x02),
         (0x7f, 0xff),
         (0x7f, 0x7f),
-        (0x05, 0xfe), // 5 / -2 -> -2, remainder 1 (sign of the DIVIDEND — C's %)
+        (0x05, 0xfe), // 5 / -2 -> -2, remainder 1 (sign of the DIVIDEND - C's %)
         (0xfb, 0x02), // -5 / 2 -> -2, remainder -1
         (0x80, 0x00), // zero divisor, negative dividend -> 1 (and remainder = dividend)
         (0x7f, 0x00), // zero divisor, positive dividend -> -1
@@ -287,7 +287,7 @@ fn a_division_recovers_a_symbolic_divisor() {
 fn shl_var_exhaustive_amounts_width8() {
     let a = 0b1011_0011u64;
     for k in 0..24u64 {
-        // A shift at or beyond the width empties the value — it does not wrap.
+        // A shift at or beyond the width empties the value - it does not wrap.
         let expected = if k >= 8 { 0 } else { maskw(a << k, 8) };
         prove(&Bv::val(a, 8).shl_var(&Bv::val(k, 8)), expected);
     }
@@ -321,7 +321,7 @@ fn ashr_var_exhaustive_amounts_width8() {
 
 #[test]
 fn shift_amount_narrower_than_the_vector() {
-    // A 4-bit amount can only reach 15, so the high stages of the barrel are never selected —
+    // A 4-bit amount can only reach 15, so the high stages of the barrel are never selected -
     // but every amount it *can* reach must still be right.
     let a = 0xabcu64;
     for k in 0..16u64 {
@@ -417,7 +417,7 @@ fn rot_var_exhaustive_amounts_width8() {
 #[test]
 fn rot_var_non_power_of_two_widths() {
     for &(a, w) in &[(0b1_0011u64, 5u32), (0b101u64, 3), (0b101_1010u64, 7)] {
-        // The amount register is `w` bits, so amounts only run to `2^w - 1` — a larger `k` would
+        // The amount register is `w` bits, so amounts only run to `2^w - 1` - a larger `k` would
         // be masked on the way in and the oracle would be comparing against a different shift.
         let span = (1u64 << w).min(41);
         for k in 0..span {
@@ -437,7 +437,7 @@ fn rot_var_non_power_of_two_widths() {
 fn rot_var_amount_wider_than_width() {
     // Regression: the amount must reduce modulo the width using every bit of `k`. Truncating `k`
     // to `w` bits first computes `(k mod 2^w) mod w`, which is wrong whenever `w` does not divide
-    // `2^w` — for w=5 and k=32 it gives 0 where the answer is 2.
+    // `2^w` - for w=5 and k=32 it gives 0 where the answer is 2.
     let a = 0b1_0011u64;
     for k in [0u64, 1, 4, 5, 6, 31, 32, 33, 100, 1023, 0xffff] {
         prove(
@@ -513,7 +513,7 @@ fn sgt_sge_exhaustive_width4() {
 
 #[test]
 fn signed_and_unsigned_comparisons_disagree_on_the_negative_half() {
-    // -1 >s -128, but 0xff >u 0x80 also holds — so compare where they *must* differ: -1 vs 0.
+    // -1 >s -128, but 0xff >u 0x80 also holds - so compare where they *must* differ: -1 vs 0.
     let (neg1, zero) = (Bv::val(0xff, 8), Bv::val(0, 8));
     prove(&neg1.sgt(&zero), 0);
     prove(&neg1.sge(&zero), 0);
@@ -521,8 +521,8 @@ fn signed_and_unsigned_comparisons_disagree_on_the_negative_half() {
     prove(&neg1.ugt(&zero), 1); // 255 > 0 unsigned
 
     let (min, max) = (Bv::val(0x80, 8), Bv::val(0x7f, 8));
-    prove(&min.sgt(&max), 0); // -128 > 127 is false…
-    prove(&min.ugt(&max), 1); // …but 128 > 127 unsigned is true
+    prove(&min.sgt(&max), 0); // -128 > 127 is false...
+    prove(&min.ugt(&max), 1); // ...but 128 > 127 unsigned is true
     prove(&max.sgt(&min), 1);
 }
 
