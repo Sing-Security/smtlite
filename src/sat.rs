@@ -9,6 +9,8 @@
 //! Propagation keeps two watched literals per clause and processes each trail assignment once,
 //! rather than re-scanning the clause set to a fixpoint - which is why the wall-clock deadline is
 //! checked *inside* propagation, once per assignment, not only between decisions: see [`solve`].
+//! Branching decides the unassigned variable with the most conflict activity (VSIDS-style) and
+//! tries its last-assigned phase first (phase saving).
 //!
 //! The solver does not branch on a variable that occurs in no clause. Such a variable is free, so
 //! any value satisfies the formula, and a [`crate::Solver`] allocates bits for every variable it
@@ -47,8 +49,9 @@ pub enum SatResult {
 enum Propagated {
     /// Reached a fixpoint with no conflict - the caller may branch.
     Fixpoint,
-    /// A clause became all-false.
-    Conflict,
+    /// A clause became all-false. The index is the conflicting clause, whose literals the caller
+    /// bumps for the branching heuristic.
+    Conflict(usize),
     /// The wall-clock deadline elapsed mid-propagation.
     Deadline,
 }
@@ -163,6 +166,11 @@ pub fn solve(
     let mut is_decision = vec![false; n];
     let mut flipped = vec![false; n];
     let mut decisions = 0u64;
+    // Branching heuristic state: VSIDS-style conflict activity per variable - the next decision
+    // prefers a variable that keeps appearing in conflicts - and phase saving: the value a
+    // variable was last assigned, tried first when it is decided again.
+    let mut activity = vec![0u64; n];
+    let mut phase = vec![false; n];
 
     // Variables that occur in at least one clause. A variable outside this set is free, so
     // branching on it only adds search: a `Solver` allocates bits for every variable it
@@ -208,40 +216,54 @@ pub fn solve(
             deadline,
         ) {
             Propagated::Deadline => return SatResult::Unknown,
-            // Conflict: backtrack to the most recent unflipped decision and flip it.
-            Propagated::Conflict => loop {
-                let Some(&v) = trail.last() else {
-                    return SatResult::Unsat; // no decisions left to undo
-                };
-                if is_decision[v] && !flipped[v] {
-                    let tried = assign[v].unwrap_or(false);
-                    assign[v] = Some(!tried);
-                    flipped[v] = true;
-                    break; // resume propagation with the flipped decision in place
+            // Conflict: bump the conflicting clause's literals, then backtrack to the most
+            // recent unflipped decision and flip it.
+            Propagated::Conflict(ci) => {
+                for &lit in clauses[ci].iter() {
+                    activity[(lit.unsigned_abs() - 1) as usize] += 1;
                 }
-                // Undo this assignment and keep unwinding.
-                trail.pop();
-                assign[v] = None;
-                is_decision[v] = false;
-                flipped[v] = false;
-            },
-            // No conflict - branch on the next unassigned variable that a clause mentions.
-            // Free variables stay unassigned and take a default value in the model.
-            Propagated::Fixpoint => match (0..n).find(|&v| active[v] && assign[v].is_none()) {
-                None => {
-                    return SatResult::Sat(assign.iter().map(|a| a.unwrap_or(false)).collect());
-                }
-                Some(v) => {
-                    decisions += 1;
-                    if decisions > budget {
-                        return SatResult::Unknown;
+                loop {
+                    let Some(&v) = trail.last() else {
+                        return SatResult::Unsat; // no decisions left to undo
+                    };
+                    if is_decision[v] && !flipped[v] {
+                        let tried = assign[v].unwrap_or(false);
+                        assign[v] = Some(!tried);
+                        flipped[v] = true;
+                        break; // resume propagation with the flipped decision in place
                     }
-                    assign[v] = Some(true);
-                    is_decision[v] = true;
+                    // Undo this assignment, remembering its value as the phase to try next.
+                    trail.pop();
+                    phase[v] = assign[v].unwrap_or(false);
+                    assign[v] = None;
+                    is_decision[v] = false;
                     flipped[v] = false;
-                    trail.push(v);
                 }
-            },
+            }
+            // No conflict - branch on the unassigned variable a clause mentions whose conflict
+            // activity is highest (ties to the lowest index, so the search stays deterministic),
+            // trying its last-assigned phase first. Free variables stay unassigned and take a
+            // default value in the model.
+            Propagated::Fixpoint => {
+                let best = (0..n)
+                    .filter(|&v| active[v] && assign[v].is_none())
+                    .min_by_key(|&v| (std::cmp::Reverse(activity[v]), v));
+                match best {
+                    None => {
+                        return SatResult::Sat(assign.iter().map(|a| a.unwrap_or(false)).collect());
+                    }
+                    Some(v) => {
+                        decisions += 1;
+                        if decisions > budget {
+                            return SatResult::Unknown;
+                        }
+                        assign[v] = Some(phase[v]);
+                        is_decision[v] = true;
+                        flipped[v] = false;
+                        trail.push(v);
+                    }
+                }
+            }
         }
 
         // After backtracking, the flipped decision is the last entry and its value changed, so it
@@ -280,7 +302,7 @@ fn propagate(
         // one is rebuilt from the clauses that stay put.
         let pending = std::mem::take(&mut watches.lists[lit_index(false_lit)]);
         let mut keep = Vec::with_capacity(pending.len());
-        let mut conflict = false;
+        let mut conflict = None;
 
         for (i, &ci) in pending.iter().enumerate() {
             let clause = clauses[ci];
@@ -331,7 +353,7 @@ fn propagate(
                 Some(_) => {
                     // `other` is false here (the true case was handled above): conflict.
                     keep.push(ci);
-                    conflict = true;
+                    conflict = Some(ci);
                     // The watchers after this one were not examined; restore them untouched.
                     keep.extend_from_slice(&pending[i + 1..]);
                     break;
@@ -341,8 +363,8 @@ fn propagate(
 
         // Restore every clause still watching the false literal.
         watches.lists[lit_index(false_lit)] = keep;
-        if conflict {
-            return Propagated::Conflict;
+        if let Some(ci) = conflict {
+            return Propagated::Conflict(ci);
         }
     }
     Propagated::Fixpoint
@@ -473,6 +495,46 @@ mod tests {
         }
         // Group the literals by hole, then forbid every pair of pigeons in the same hole.
         let mut holes: [Vec<i32>; 2] = [Vec::new(), Vec::new()];
+        for pigeon in &x {
+            for (hole, &lit) in pigeon.iter().enumerate() {
+                holes[hole].push(lit);
+            }
+        }
+        for column in &holes {
+            for (i, &p) in column.iter().enumerate() {
+                for &q in &column[i + 1..] {
+                    cnf.add_clause(&[-p, -q]); // no two pigeons share a hole
+                }
+            }
+        }
+        assert_eq!(cnf.solve_within(1_000_000, None), SatResult::Unsat);
+    }
+
+    #[test]
+    fn test_pigeonhole_nine_pigeons_eight_holes_is_unsat() {
+        // A larger search-heavy refutation: deep backtracking with the activity heuristic
+        // steering the decisions, not a short unit-propagation proof.
+        let bump = bumpalo::Bump::new();
+        let mut cnf = Cnf::new(&bump);
+        let mut x = [[0i32; 8]; 9];
+        for pigeon in &mut x {
+            for slot in pigeon.iter_mut() {
+                *slot = cnf.new_var();
+            }
+        }
+        for pigeon in &x {
+            cnf.add_clause(pigeon); // sits somewhere
+        }
+        let mut holes: [Vec<i32>; 8] = [
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ];
         for pigeon in &x {
             for (hole, &lit) in pigeon.iter().enumerate() {
                 holes[hole].push(lit);
