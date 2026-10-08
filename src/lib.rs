@@ -47,6 +47,7 @@ mod blast;
 mod bv;
 mod sat;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 pub use bv::{Bv, mask};
@@ -95,6 +96,17 @@ pub struct Solver {
     vars: Vec<(String, u32)>,
     asserts: Vec<Bv>,
     max_clauses: usize,
+    cache: RefCell<Option<Cache>>,
+}
+
+/// The blasted background of the stored constraints, kept so the per-path entry points can reuse
+/// it instead of re-blasting the shared part for every query. Owned clause vectors, so it outlives
+/// the arena it was blasted from.
+#[derive(Debug)]
+struct Cache {
+    clauses: Vec<Vec<i32>>,
+    nvars: usize,
+    var_bits: HashMap<usize, Vec<i32>>,
 }
 
 impl Default for Solver {
@@ -103,6 +115,7 @@ impl Default for Solver {
             vars: Vec::new(),
             asserts: Vec::new(),
             max_clauses: DEFAULT_MAX_CLAUSES,
+            cache: RefCell::new(None),
         }
     }
 }
@@ -150,6 +163,7 @@ impl Solver {
         );
         let id = self.vars.len();
         self.vars.push((name.to_string(), width));
+        self.cache.replace(None);
         Bv::wrap(Node::Var(width, id))
     }
 
@@ -208,6 +222,7 @@ impl Solver {
             constraint.width()
         );
         self.asserts.push(constraint);
+        self.cache.replace(None);
     }
 
     /// Solve the accumulated constraints with the default budget.
@@ -227,9 +242,60 @@ impl Solver {
     }
 
     /// Solve, spending at most `budget` decisions.
+    ///
+    /// The stored constraints are blasted once and cached, so repeated checks against an
+    /// unchanged background only pay for the blast on the first one.
     #[must_use]
     pub fn check_with_budget(&self, budget: u64) -> Solution {
-        self.solve_constraints(&self.asserts, budget, None)
+        self.solve_assumptions(&[], budget, None)
+    }
+
+    /// Solve the stored constraints together with an extra, per-call set of 1-bit constraints,
+    /// with the default budget.
+    ///
+    /// Each element of `assumptions` is asserted just for this call and dropped after, so the
+    /// next solve sees only the stored constraints. This is the "background once, many paths"
+    /// pattern: a caller asserts the shared part once, then asks one question per path with that
+    /// path's branch conditions on top.
+    ///
+    /// The background is blasted once and reused; each call only blasts its assumptions. See
+    /// [`check_all`](Self::check_all) for the other mode, where the passed constraints are the
+    /// whole formula and nothing stored takes part.
+    ///
+    /// ```
+    /// use smtlite::{Bv, Solution, Solver};
+    ///
+    /// let mut s = Solver::new();
+    /// let x = s.var("x", 8);
+    /// s.assert(x.ult(&Bv::val(10, 8))); // background: x < 10
+    ///
+    /// assert!(matches!(s.check_assumptions(&[x.ugt(&Bv::val(5, 8))]), Solution::Sat(_)));
+    /// // The assumption did not leak: x < 10 and x < 5 still have a solution.
+    /// assert!(matches!(s.check_assumptions(&[x.ult(&Bv::val(5, 8))]), Solution::Sat(_)));
+    /// // x < 10 and x > 20 is unsat.
+    /// assert!(matches!(s.check_assumptions(&[x.ugt(&Bv::val(20, 8))]), Solution::Unsat));
+    /// ```
+    #[must_use]
+    pub fn check_assumptions(&self, assumptions: &[Bv]) -> Solution {
+        self.check_assumptions_with_budget(assumptions, DEFAULT_BUDGET)
+    }
+
+    /// [`check_assumptions`](Self::check_assumptions) with an explicit decision budget.
+    #[must_use]
+    pub fn check_assumptions_with_budget(&self, assumptions: &[Bv], budget: u64) -> Solution {
+        self.solve_assumptions(assumptions, budget, None)
+    }
+
+    /// [`check_assumptions_with_budget`](Self::check_assumptions_with_budget) plus a wall-clock
+    /// `deadline`.
+    #[must_use]
+    pub fn check_assumptions_within(
+        &self,
+        assumptions: &[Bv],
+        budget: u64,
+        deadline: std::time::Instant,
+    ) -> Solution {
+        self.solve_assumptions(assumptions, budget, Some(deadline))
     }
 
     /// Solve an explicit set of constraints *without* storing them, against the variables
@@ -291,22 +357,86 @@ impl Solver {
             return Solution::Unknown;
         }
         match b.cnf.solve_within(budget, deadline) {
-            Sat(assignment) => {
-                let name_to_id = self
-                    .vars
-                    .iter()
-                    .enumerate()
-                    .map(|(id, (n, _))| (n.clone(), id))
-                    .collect();
-                Solution::Sat(Model {
-                    assignment,
-                    var_bits: b.var_bits,
-                    name_to_id,
-                })
-            }
+            Sat(assignment) => Solution::Sat(Model {
+                assignment,
+                var_bits: b.var_bits,
+                name_to_id: self.name_to_id(),
+            }),
             Unsat => Solution::Unsat,
             Unknown => Solution::Unknown,
         }
+    }
+
+    fn solve_assumptions(
+        &self,
+        assumptions: &[Bv],
+        budget: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> Solution {
+        self.ensure_cache();
+        let cache = self.cache.borrow();
+        let cache = cache.as_ref().expect("the cache was just built");
+
+        // A fresh arena and blaster for this call's clauses. Seed it with the background's
+        // literals for every declared variable and continue the variable counter after them, so
+        // the assumption gates never collide with the cached bits.
+        let bump = bumpalo::Bump::new();
+        let mut b = Blaster::new(&bump);
+        b.var_bits = cache.var_bits.clone();
+        b.cnf.nvars = cache.nvars;
+        for c in assumptions {
+            b.assert_true(c);
+        }
+
+        // Background clauses first, then the assumption clauses that borrow this call's arena.
+        let mut clauses: Vec<&[i32]> = cache.clauses.iter().map(|c| c.as_slice()).collect();
+        clauses.extend(b.cnf.clauses.iter().copied());
+
+        if clauses.len() > self.max_clauses {
+            return Solution::Unknown;
+        }
+        match sat::solve(&clauses, b.cnf.nvars, budget, deadline) {
+            Sat(assignment) => Solution::Sat(Model {
+                assignment,
+                var_bits: b.var_bits,
+                name_to_id: self.name_to_id(),
+            }),
+            Unsat => Solution::Unsat,
+            Unknown => Solution::Unknown,
+        }
+    }
+
+    /// Build the cached blast of the stored constraints if it is not already there.
+    fn ensure_cache(&self) {
+        let mut cache = self.cache.borrow_mut();
+        if cache.is_none() {
+            *cache = Some(self.blast_background());
+        }
+    }
+
+    /// Blast the stored constraints once, copying the clauses out of the arena so they outlive it.
+    fn blast_background(&self) -> Cache {
+        let bump = bumpalo::Bump::new();
+        let mut b = Blaster::new(&bump);
+        for (id, (_, width)) in self.vars.iter().enumerate() {
+            b.declare_var(id, *width);
+        }
+        for c in &self.asserts {
+            b.assert_true(c);
+        }
+        Cache {
+            clauses: b.cnf.clauses.iter().map(|c| c.to_vec()).collect(),
+            nvars: b.cnf.nvars,
+            var_bits: b.var_bits,
+        }
+    }
+
+    fn name_to_id(&self) -> HashMap<String, usize> {
+        self.vars
+            .iter()
+            .enumerate()
+            .map(|(id, (n, _))| (n.clone(), id))
+            .collect()
     }
 }
 

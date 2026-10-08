@@ -9,7 +9,7 @@
 //! non-chronological backjumping. The clause set is re-scanned to a fixpoint on every
 //! propagation pass, which is why a sweep passes a wall-clock deadline alongside the decision
 //! budget - and why that deadline is checked *inside* propagation, not only between decisions:
-//! see [`Cnf::solve_within`].
+//! see [`solve`].
 //!
 //! The solver does not branch on a variable that occurs in no clause. Such a variable is free, so
 //! any value satisfies the formula, and a [`crate::Solver`] allocates bits for every variable it
@@ -91,120 +91,142 @@ impl<'b> Cnf<'b> {
     /// single clause scan rather than to however long a whole fixpoint takes.
     #[must_use]
     pub fn solve_within(&self, budget: u64, deadline: Option<Instant>) -> SatResult {
-        let n = self.nvars;
-        let mut assign: Vec<Option<bool>> = vec![None; n];
-        let mut trail: Vec<usize> = Vec::new(); // variable indices, in assignment order
-        let mut is_decision = vec![false; n];
-        let mut flipped = vec![false; n];
-        let mut decisions = 0u64;
+        solve(&self.clauses, self.nvars, budget, deadline)
+    }
+}
 
-        // Variables that occur in at least one clause. A variable outside this set is free, so
-        // branching on it only adds search: a `Solver` allocates bits for every variable it
-        // declares, including ones no constraint mentions.
-        let mut active = vec![false; n];
-        for clause in &self.clauses {
-            for &lit in clause.iter() {
-                active[(lit.unsigned_abs() - 1) as usize] = true;
-            }
-        }
+/// Solve a CNF formula given as borrowed clauses, bounded by a decision budget and an optional
+/// wall-clock `deadline`.
+///
+/// This is the DPLL core shared by [`Cnf::solve_within`] and the incremental path in
+/// [`crate::Solver`], which blasts its background once and appends per-call clauses in front of
+/// the same search. The clauses may borrow from different arenas; only the slices themselves are
+/// read here.
+///
+/// The budget alone is a poor time proxy: `propagate` rescans every clause per fixpoint, so a
+/// propagation-heavy formula burns seconds between decisions. The deadline is therefore checked
+/// *inside* propagation as well as once per decision cycle, which bounds the overshoot to a
+/// single clause scan rather than to however long a whole fixpoint takes.
+#[must_use]
+pub fn solve(
+    clauses: &[&[i32]],
+    nvars: usize,
+    budget: u64,
+    deadline: Option<Instant>,
+) -> SatResult {
+    let n = nvars;
+    let mut assign: Vec<Option<bool>> = vec![None; n];
+    let mut trail: Vec<usize> = Vec::new(); // variable indices, in assignment order
+    let mut is_decision = vec![false; n];
+    let mut flipped = vec![false; n];
+    let mut decisions = 0u64;
 
-        loop {
-            match self.propagate(&mut assign, &mut trail, &mut is_decision, deadline) {
-                Propagated::Deadline => return SatResult::Unknown,
-                // Conflict: backtrack to the most recent unflipped decision and flip it.
-                Propagated::Conflict => loop {
-                    let Some(&v) = trail.last() else {
-                        return SatResult::Unsat; // no decisions left to undo
-                    };
-                    if is_decision[v] && !flipped[v] {
-                        let tried = assign[v].unwrap_or(false);
-                        assign[v] = Some(!tried);
-                        flipped[v] = true;
-                        break; // resume propagation with the flipped decision in place
-                    }
-                    // Undo this assignment and keep unwinding.
-                    trail.pop();
-                    assign[v] = None;
-                    is_decision[v] = false;
-                    flipped[v] = false;
-                },
-                // No conflict - branch on the next unassigned variable that a clause mentions.
-                // Free variables stay unassigned and take a default value in the model.
-                Propagated::Fixpoint => match (0..n).find(|&v| active[v] && assign[v].is_none()) {
-                    None => {
-                        return SatResult::Sat(assign.iter().map(|a| a.unwrap_or(false)).collect());
-                    }
-                    Some(v) => {
-                        decisions += 1;
-                        if decisions > budget {
-                            return SatResult::Unknown;
-                        }
-                        assign[v] = Some(true);
-                        is_decision[v] = true;
-                        flipped[v] = false;
-                        trail.push(v);
-                    }
-                },
-            }
+    // Variables that occur in at least one clause. A variable outside this set is free, so
+    // branching on it only adds search: a `Solver` allocates bits for every variable it
+    // declares, including ones no constraint mentions.
+    let mut active = vec![false; n];
+    for clause in clauses {
+        for &lit in clause.iter() {
+            active[(lit.unsigned_abs() - 1) as usize] = true;
         }
     }
 
-    /// Unit propagation to a fixpoint. Reports whether it hit a conflict, settled, or ran out of
-    /// wall-clock `deadline` mid-scan - the last so a propagation-heavy formula cannot outlast a
-    /// deadline the way a decision-count check alone would let it.
-    fn propagate(
-        &self,
-        assign: &mut [Option<bool>],
-        trail: &mut Vec<usize>,
-        is_decision: &mut [bool],
-        deadline: Option<Instant>,
-    ) -> Propagated {
-        loop {
-            // Once per full rescan: a scan is this loop's unit of work, so checking here bounds the
-            // overshoot to one scan rather than to the whole propagation. Cheap enough to ignore
-            // when the passes are many and fast.
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                return Propagated::Deadline;
-            }
-            let mut changed = false;
-            for clause in &self.clauses {
-                let mut unit: Option<i32> = None;
-                let mut unassigned = 0;
-                let mut satisfied = false;
-                for &lit in clause.iter() {
-                    let v = (lit.unsigned_abs() - 1) as usize;
-                    let want = lit > 0;
-                    match assign[v] {
-                        Some(b) => {
-                            if b == want {
-                                satisfied = true;
-                                break;
-                            }
-                        }
-                        None => {
-                            unassigned += 1;
-                            unit = Some(lit);
+    loop {
+        match propagate(clauses, &mut assign, &mut trail, &mut is_decision, deadline) {
+            Propagated::Deadline => return SatResult::Unknown,
+            // Conflict: backtrack to the most recent unflipped decision and flip it.
+            Propagated::Conflict => loop {
+                let Some(&v) = trail.last() else {
+                    return SatResult::Unsat; // no decisions left to undo
+                };
+                if is_decision[v] && !flipped[v] {
+                    let tried = assign[v].unwrap_or(false);
+                    assign[v] = Some(!tried);
+                    flipped[v] = true;
+                    break; // resume propagation with the flipped decision in place
+                }
+                // Undo this assignment and keep unwinding.
+                trail.pop();
+                assign[v] = None;
+                is_decision[v] = false;
+                flipped[v] = false;
+            },
+            // No conflict - branch on the next unassigned variable that a clause mentions.
+            // Free variables stay unassigned and take a default value in the model.
+            Propagated::Fixpoint => match (0..n).find(|&v| active[v] && assign[v].is_none()) {
+                None => {
+                    return SatResult::Sat(assign.iter().map(|a| a.unwrap_or(false)).collect());
+                }
+                Some(v) => {
+                    decisions += 1;
+                    if decisions > budget {
+                        return SatResult::Unknown;
+                    }
+                    assign[v] = Some(true);
+                    is_decision[v] = true;
+                    flipped[v] = false;
+                    trail.push(v);
+                }
+            },
+        }
+    }
+}
+
+/// Unit propagation to a fixpoint. Reports whether it hit a conflict, settled, or ran out of
+/// wall-clock `deadline` mid-scan - the last so a propagation-heavy formula cannot outlast a
+/// deadline the way a decision-count check alone would let it.
+fn propagate(
+    clauses: &[&[i32]],
+    assign: &mut [Option<bool>],
+    trail: &mut Vec<usize>,
+    is_decision: &mut [bool],
+    deadline: Option<Instant>,
+) -> Propagated {
+    loop {
+        // Once per full rescan: a scan is this loop's unit of work, so checking here bounds the
+        // overshoot to one scan rather than to the whole propagation. Cheap enough to ignore
+        // when the passes are many and fast.
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Propagated::Deadline;
+        }
+        let mut changed = false;
+        for clause in clauses {
+            let mut unit: Option<i32> = None;
+            let mut unassigned = 0;
+            let mut satisfied = false;
+            for &lit in clause.iter() {
+                let v = (lit.unsigned_abs() - 1) as usize;
+                let want = lit > 0;
+                match assign[v] {
+                    Some(b) => {
+                        if b == want {
+                            satisfied = true;
+                            break;
                         }
                     }
-                }
-                if satisfied {
-                    continue;
-                }
-                if unassigned == 0 {
-                    return Propagated::Conflict; // all literals false - conflict
-                }
-                if unassigned == 1 {
-                    let lit = unit.unwrap_or(0);
-                    let v = (lit.unsigned_abs() - 1) as usize;
-                    assign[v] = Some(lit > 0);
-                    is_decision[v] = false;
-                    trail.push(v);
-                    changed = true;
+                    None => {
+                        unassigned += 1;
+                        unit = Some(lit);
+                    }
                 }
             }
-            if !changed {
-                return Propagated::Fixpoint;
+            if satisfied {
+                continue;
             }
+            if unassigned == 0 {
+                return Propagated::Conflict; // all literals false - conflict
+            }
+            if unassigned == 1 {
+                let lit = unit.unwrap_or(0);
+                let v = (lit.unsigned_abs() - 1) as usize;
+                assign[v] = Some(lit > 0);
+                is_decision[v] = false;
+                trail.push(v);
+                changed = true;
+            }
+        }
+        if !changed {
+            return Propagated::Fixpoint;
         }
     }
 }

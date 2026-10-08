@@ -123,6 +123,107 @@ fn check_all_ignores_stored_asserts_and_does_not_mutate_them() {
     assert_eq!(sat(&s).get("x"), Some(5));
 }
 
+// ---- Incremental assumptions --------------------------------------------------------------
+
+#[test]
+fn assumptions_combine_with_the_stored_background_not_replace_it() {
+    // `check_assumptions` solves asserts ++ assumptions; `check_all` solves assumptions alone.
+    let mut s = Solver::new();
+    let x = s.var("x", 8);
+    s.assert(x.eq(&Bv::val(5, 8)));
+
+    // Against the background x == 5, an assumption x == 9 is unsat...
+    assert!(matches!(
+        s.check_assumptions(&[x.eq(&Bv::val(9, 8))]),
+        Solution::Unsat
+    ));
+    // ...whereas `check_all` treats x == 9 as the whole formula and finds it satisfiable.
+    assert!(matches!(
+        s.check_all(&[x.eq(&Bv::val(9, 8))]),
+        Solution::Sat(_)
+    ));
+}
+
+#[test]
+fn assumptions_do_not_leak_into_the_next_solve() {
+    let mut s = Solver::new();
+    let x = s.var("x", 8);
+    s.assert(x.ult(&Bv::val(10, 8))); // background: x < 10
+
+    // x > 5 is satisfiable against the background...
+    assert!(matches!(
+        s.check_assumptions(&[x.ugt(&Bv::val(5, 8))]),
+        Solution::Sat(_)
+    ));
+    // ...and it did not stick: x < 5 (which contradicts x > 5) is also satisfiable.
+    assert!(matches!(
+        s.check_assumptions(&[x.ult(&Bv::val(5, 8))]),
+        Solution::Sat(_)
+    ));
+}
+
+#[test]
+fn assert_invalidates_the_cached_background() {
+    let mut s = Solver::new();
+    let x = s.var("x", 8);
+    s.assert(x.eq(&Bv::val(5, 8)));
+    assert!(matches!(s.check(), Solution::Sat(_)));
+
+    // A later assert must take effect, not be hidden behind a stale blast of the old background.
+    s.assert(x.eq(&Bv::val(6, 8)));
+    assert!(matches!(s.check(), Solution::Unsat));
+}
+
+#[test]
+fn var_invalidates_the_cached_background_so_the_model_stays_total() {
+    let mut s = Solver::new();
+    let x = s.var("x", 8);
+    s.assert(x.eq(&Bv::val(5, 8)));
+    assert!(matches!(s.check(), Solution::Sat(_)));
+
+    // A variable declared after the background was blasted still reads back in later models.
+    let y = s.var("y", 8);
+    match s.check() {
+        Solution::Sat(m) => {
+            assert_eq!(m.get("x"), Some(5));
+            assert!(m.get("y").is_some(), "a later-declared variable reads back");
+        }
+        other => panic!("expected SAT, got {other:?}"),
+    }
+
+    // And the new variable participates in constraints, too.
+    s.assert(y.eq(&Bv::val(7, 8)));
+    match s.check() {
+        Solution::Sat(m) => assert_eq!(m.get("y"), Some(7)),
+        other => panic!("expected SAT, got {other:?}"),
+    }
+}
+
+#[test]
+fn assumption_budget_and_deadline_variants_degrade_the_same_way() {
+    let mut s = Solver::new();
+    let x = s.var("x", 8);
+
+    // Refuted by propagation alone: a zero budget still proves it unsat.
+    assert!(matches!(
+        s.check_assumptions_with_budget(&[x.eq(&Bv::val(1, 8)), x.eq(&Bv::val(2, 8))], 0),
+        Solution::Unsat
+    ));
+
+    // An already-elapsed deadline answers Unknown, never a verdict.
+    let past = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
+    assert!(matches!(
+        s.check_assumptions_within(
+            &[x.eq(&Bv::val(1, 8)), x.eq(&Bv::val(2, 8))],
+            1_000_000,
+            past
+        ),
+        Solution::Unknown
+    ));
+}
+
 // ---- Provenance ---------------------------------------------------------------------------
 
 #[test]
