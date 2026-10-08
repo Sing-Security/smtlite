@@ -1,15 +1,14 @@
-//! A small, self-contained SAT core: iterative DPLL with unit propagation, chronological
-//! backtracking (branch-and-flip), and a step budget so a hard query degrades to `Unknown`
-//! rather than running without a bound.
+//! A small, self-contained SAT core: iterative DPLL with two-watched-literal unit propagation,
+//! chronological backtracking (branch-and-flip), and a step budget so a hard query degrades to
+//! `Unknown` rather than running without a bound.
 //!
 //! Literals are `i32`: `+(v+1)` for the positive polarity of variable `v`, `-(v+1)` for the
 //! negative. Variable 0 is literal `1` / `-1`.
 //!
-//! Not present: pure-literal elimination, watched literals, clause learning and
-//! non-chronological backjumping. The clause set is re-scanned to a fixpoint on every
-//! propagation pass, which is why a sweep passes a wall-clock deadline alongside the decision
-//! budget - and why that deadline is checked *inside* propagation, not only between decisions:
-//! see [`solve`].
+//! Not present: pure-literal elimination, clause learning and non-chronological backjumping.
+//! Propagation keeps two watched literals per clause and processes each trail assignment once,
+//! rather than re-scanning the clause set to a fixpoint - which is why the wall-clock deadline is
+//! checked *inside* propagation, once per assignment, not only between decisions: see [`solve`].
 //!
 //! The solver does not branch on a variable that occurs in no clause. Such a variable is free, so
 //! any value satisfies the formula, and a [`crate::Solver`] allocates bits for every variable it
@@ -54,6 +53,41 @@ enum Propagated {
     Deadline,
 }
 
+/// The two-watched-literal index for one solve. Each clause keeps two watched positions; a clause
+/// is only examined when one of those two literals becomes false, so propagation touches a clause
+/// on assignment rather than on every pass.
+struct Watches {
+    /// For each literal (indexed by [`lit_index`]), the clauses currently watching it.
+    lists: Vec<Vec<usize>>,
+    /// For each clause, its two watched positions within the clause.
+    watch: Vec<[usize; 2]>,
+}
+
+/// A literal's index in the watch table: `2*var + (0 if positive, 1 if negative)`.
+fn lit_index(lit: i32) -> usize {
+    (lit.unsigned_abs() - 1) as usize * 2 + usize::from(lit < 0)
+}
+
+/// Build the watch index: a clause of two or more literals watches its first two positions; a
+/// unit clause watches its single literal twice (a false single literal is then a conflict).
+fn build_watches(clauses: &[&[i32]], nvars: usize) -> Watches {
+    let mut lists = vec![Vec::new(); 2 * nvars];
+    let mut watch = Vec::with_capacity(clauses.len());
+    for (ci, clause) in clauses.iter().enumerate() {
+        let pair = if clause.len() >= 2 {
+            [0usize, 1]
+        } else {
+            [0usize, 0]
+        };
+        lists[lit_index(clause[pair[0]])].push(ci);
+        if clause.len() >= 2 {
+            lists[lit_index(clause[pair[1]])].push(ci);
+        }
+        watch.push(pair);
+    }
+    Watches { lists, watch }
+}
+
 impl<'b> Cnf<'b> {
     /// An empty formula over zero variables, whose clauses will be allocated in `bump`.
     #[must_use]
@@ -85,10 +119,10 @@ impl<'b> Cnf<'b> {
 
     /// Solve, bounded by both a decision budget and an optional wall-clock `deadline`.
     ///
-    /// The budget alone is a poor time proxy: `propagate` rescans every clause per fixpoint, so a
-    /// propagation-heavy formula burns seconds between decisions. The deadline is therefore checked
-    /// *inside* propagation as well as once per decision cycle, which bounds the overshoot to a
-    /// single clause scan rather than to however long a whole fixpoint takes.
+    /// The budget alone is a poor time proxy: propagation is cheap per assignment but unbounded in
+    /// total, so a propagation-heavy formula can still burn time between decisions. The deadline is
+    /// therefore checked *inside* propagation, once per trail assignment, which bounds the overshoot
+    /// to a single assignment's watch list.
     #[must_use]
     pub fn solve_within(&self, budget: u64, deadline: Option<Instant>) -> SatResult {
         solve(&self.clauses, self.nvars, budget, deadline)
@@ -103,10 +137,10 @@ impl<'b> Cnf<'b> {
 /// the same search. The clauses may borrow from different arenas; only the slices themselves are
 /// read here.
 ///
-/// The budget alone is a poor time proxy: `propagate` rescans every clause per fixpoint, so a
-/// propagation-heavy formula burns seconds between decisions. The deadline is therefore checked
-/// *inside* propagation as well as once per decision cycle, which bounds the overshoot to a
-/// single clause scan rather than to however long a whole fixpoint takes.
+/// The budget alone is a poor time proxy: propagation is cheap per assignment but unbounded in
+/// total, so a propagation-heavy formula can still burn time between decisions. The deadline is
+/// therefore checked *inside* propagation, once per trail assignment, which bounds the overshoot
+/// to a single assignment's watch list.
 #[must_use]
 pub fn solve(
     clauses: &[&[i32]],
@@ -114,6 +148,15 @@ pub fn solve(
     budget: u64,
     deadline: Option<Instant>,
 ) -> SatResult {
+    // An elapsed deadline answers Unknown, not a verdict the search has not actually earned.
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return SatResult::Unknown;
+    }
+    // The empty clause is the empty disjunction, i.e. false: unsatisfiable outright.
+    if clauses.iter().any(|c| c.is_empty()) {
+        return SatResult::Unsat;
+    }
+
     let n = nvars;
     let mut assign: Vec<Option<bool>> = vec![None; n];
     let mut trail: Vec<usize> = Vec::new(); // variable indices, in assignment order
@@ -131,8 +174,39 @@ pub fn solve(
         }
     }
 
+    let mut watches = build_watches(clauses, n);
+
+    // Seed the unit clauses: nothing is assigned yet, so the only clauses already unit are the
+    // single-literal ones (including the pinned-true literal every blast emits). Their literals
+    // go on the trail before the main loop, and `propagate` processes them like any assignment.
+    for clause in clauses {
+        if clause.len() == 1 {
+            let lit = clause[0];
+            let v = (lit.unsigned_abs() - 1) as usize;
+            match assign[v] {
+                Some(b) if b != (lit > 0) => return SatResult::Unsat, // [x] and [-x]
+                Some(_) => {}
+                None => {
+                    assign[v] = Some(lit > 0);
+                    trail.push(v);
+                }
+            }
+        }
+    }
+
+    // The next trail entry `propagate` has yet to process.
+    let mut prop_head = 0usize;
+
     loop {
-        match propagate(clauses, &mut assign, &mut trail, &mut is_decision, deadline) {
+        match propagate(
+            clauses,
+            &mut watches,
+            &mut assign,
+            &mut trail,
+            &mut is_decision,
+            &mut prop_head,
+            deadline,
+        ) {
             Propagated::Deadline => return SatResult::Unknown,
             // Conflict: backtrack to the most recent unflipped decision and flip it.
             Propagated::Conflict => loop {
@@ -169,66 +243,109 @@ pub fn solve(
                 }
             },
         }
+
+        // After backtracking, the flipped decision is the last entry and its value changed, so it
+        // must be re-processed. After branching, the new decision is the last entry and is
+        // processed for the first time. Either way, resume from the last entry.
+        prop_head = trail.len().saturating_sub(1);
     }
 }
 
-/// Unit propagation to a fixpoint. Reports whether it hit a conflict, settled, or ran out of
-/// wall-clock `deadline` mid-scan - the last so a propagation-heavy formula cannot outlast a
-/// deadline the way a decision-count check alone would let it.
+/// Two-watched-literal unit propagation. Processes each trail assignment from `prop_head` to the
+/// end: the negation of the newly-true literal is false, so every clause watching that literal is
+/// either satisfied (keep watching), has its watch moved to a still-possible literal, or has
+/// become unit (enqueue the remaining literal) or conflicting.
 fn propagate(
     clauses: &[&[i32]],
+    watches: &mut Watches,
     assign: &mut [Option<bool>],
     trail: &mut Vec<usize>,
     is_decision: &mut [bool],
+    prop_head: &mut usize,
     deadline: Option<Instant>,
 ) -> Propagated {
-    loop {
-        // Once per full rescan: a scan is this loop's unit of work, so checking here bounds the
-        // overshoot to one scan rather than to the whole propagation. Cheap enough to ignore
-        // when the passes are many and fast.
+    while *prop_head < trail.len() {
+        // Check the deadline once per assignment: cheap when absent, and it bounds the overshoot
+        // to a single assignment's watch list rather than to the whole propagation.
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return Propagated::Deadline;
         }
-        let mut changed = false;
-        for clause in clauses {
-            let mut unit: Option<i32> = None;
-            let mut unassigned = 0;
-            let mut satisfied = false;
-            for &lit in clause.iter() {
-                let v = (lit.unsigned_abs() - 1) as usize;
-                let want = lit > 0;
-                match assign[v] {
-                    Some(b) => {
-                        if b == want {
-                            satisfied = true;
-                            break;
-                        }
-                    }
-                    None => {
-                        unassigned += 1;
-                        unit = Some(lit);
-                    }
-                }
-            }
-            if satisfied {
+        let v = trail[*prop_head];
+        *prop_head += 1;
+        let value = assign[v].unwrap_or(false);
+        // The literal this assignment made false is the negation of the newly-true one.
+        let false_lit = if value { -(v as i32 + 1) } else { v as i32 + 1 };
+
+        // Take the list out so watches moved to another literal can be appended there while this
+        // one is rebuilt from the clauses that stay put.
+        let pending = std::mem::take(&mut watches.lists[lit_index(false_lit)]);
+        let mut keep = Vec::with_capacity(pending.len());
+        let mut conflict = false;
+
+        for (i, &ci) in pending.iter().enumerate() {
+            let clause = clauses[ci];
+            let w = watches.watch[ci];
+            // Which of the two watched positions is the literal that just became false?
+            let slot = if clause[w[0]] == false_lit { 0 } else { 1 };
+            let other_slot = slot ^ 1;
+            let other = clause[w[other_slot]];
+            let other_v = (other.unsigned_abs() - 1) as usize;
+
+            if assign[other_v] == Some(other > 0) {
+                // The other watched literal is already true: the clause is satisfied, so leave it
+                // watching the false literal and move on.
+                keep.push(ci);
                 continue;
             }
-            if unassigned == 0 {
-                return Propagated::Conflict; // all literals false - conflict
+
+            // Look for another, non-false literal to watch instead.
+            let mut moved = false;
+            for (k, &l) in clause.iter().enumerate() {
+                if k == w[0] || k == w[1] {
+                    continue;
+                }
+                let lv = (l.unsigned_abs() - 1) as usize;
+                let want = l > 0;
+                if assign[lv] != Some(!want) {
+                    let mut nw = w;
+                    nw[slot] = k;
+                    watches.watch[ci] = nw;
+                    watches.lists[lit_index(l)].push(ci);
+                    moved = true;
+                    break;
+                }
             }
-            if unassigned == 1 {
-                let lit = unit.unwrap_or(0);
-                let v = (lit.unsigned_abs() - 1) as usize;
-                assign[v] = Some(lit > 0);
-                is_decision[v] = false;
-                trail.push(v);
-                changed = true;
+            if moved {
+                continue;
+            }
+
+            // No non-false replacement: the clause is unit (other unassigned) or all-false.
+            match assign[other_v] {
+                None => {
+                    // Unit: force the remaining literal and keep watching the false literal.
+                    assign[other_v] = Some(other > 0);
+                    is_decision[other_v] = false;
+                    trail.push(other_v);
+                    keep.push(ci);
+                }
+                Some(_) => {
+                    // `other` is false here (the true case was handled above): conflict.
+                    keep.push(ci);
+                    conflict = true;
+                    // The watchers after this one were not examined; restore them untouched.
+                    keep.extend_from_slice(&pending[i + 1..]);
+                    break;
+                }
             }
         }
-        if !changed {
-            return Propagated::Fixpoint;
+
+        // Restore every clause still watching the false literal.
+        watches.lists[lit_index(false_lit)] = keep;
+        if conflict {
+            return Propagated::Conflict;
         }
     }
+    Propagated::Fixpoint
 }
 
 #[cfg(test)]
