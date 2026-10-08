@@ -1,14 +1,14 @@
 # smtlite
 
-A small, pure-Rust **QF_BV** SMT solver - quantifier-free bitvector formulas, solved by
-bit-blasting to CNF and running a self-contained DPLL core over it.
+A small, pure-Rust SMT solver for **QF_BV** - quantifier-free formulas over bitvectors. It takes a
+bitvector expression, bit-blasts it to CNF, and runs its own DPLL SAT core over the result.
 
 No external solver. No C. No `unsafe`. One dependency (`bumpalo`, an arena allocator).
 
-It exists for one job: answering **directed, single-function** queries - "is there an input that
+It exists for one job: answering **directed, single-function** questions - "is there an input that
 makes this operation overflow?", "can this length field reach that copy?" - fast enough to sit
-inside a symbolic executor that asks thousands of them. It is deliberately *not* a general-purpose
-Z3 replacement.
+inside a symbolic executor that asks thousands of them. It is not a general-purpose Z3
+replacement, and it does not try to be.
 
 ```rust
 use smtlite::{Solver, Bv, Solution};
@@ -22,28 +22,37 @@ match s.check() {
 }
 ```
 
-## What it does
+## Expressions
 
-- Bitvector variables of any width from 1 to 64 bits, plus constants.
-- Boolean: `and`, `or`, `xor`, `not`, `land` (logical and of two 1-bit values).
-- Arithmetic: `add`, `sub`, `mul`, `neg` - all wraparound, as bitvectors are.
-- Division and remainder: unsigned `udiv`/`urem` and signed `sdiv`/`srem`, with the SMT-LIB
-  zero-divisor semantics - `bvudiv` by zero is all-ones, `bvurem` by zero is the dividend,
-  `bvsdiv` by zero is all-ones for a non-negative dividend and `1` otherwise. `srem` takes the
-  sign of the **dividend** (C's `%`), not the divisor's as `bvsmod` would.
-- Shifts: `shl`, `lshr`, `ashr` by a **constant** amount, and `shl_var`, `lshr_var`, `ashr_var`
-  by a **symbolic** one. Shifting at or past the width empties the value (zero-fill, or sign-fill
-  for `ashr_var`) - a shift is not a rotate.
-- Rotates: `rotl`/`rotr` by a constant and `rotl_var`/`rotr_var` by a symbolic amount. A rotate is
-  a bit permutation, so it costs no gates at all and never empties the value.
-- Comparison: `eq`, `ne`, `ult`, `ule`, `ugt`, `uge`, `slt`, `sle`, `sgt`, `sge` - each yields a
-  1-bit value you can feed into other operations.
-- Width: `zext`, `sext`, `extract(hi, lo)`, `concat`.
-- `ite(cond, then, else)`.
-- A model back out: `Model::get(name)` returns the concrete `u64` a variable took, or `None` if
-  no variable by that name was ever declared.
+Variables are bitvectors 1 to 64 bits wide. Widths are checked, not trusted: building a value
+wider than 64 bits, or combining two values of different widths, panics rather than quietly
+blasting the wrong bits. Every method whose inputs have to satisfy something says so under
+`# Panics`. Constants fold eagerly as they are built - `Bv::val(1, 8).add(&Bv::val(1, 8))` is the
+constant `2` before it ever meets the solver.
 
-`Solver::depends_on(&bv, "mem")` answers a question a caller asks constantly - did this value
+The usual operators are all there: boolean `and`/`or`/`xor`/`not`/`land`, wraparound
+`add`/`sub`/`mul`/`neg`, and comparisons `eq`/`ne`/`ult`/`ule`/`ugt`/`uge`/`slt`/`sle`/`sgt`/`sge`,
+each of which yields a 1-bit value you can feed into other operations. Width plumbing is
+`zext`/`sext`/`extract`/`concat`, plus `ite(cond, then, else)`.
+
+Division follows SMT-LIB, not Rust: dividing by zero is a defined value, not a panic. `x.udiv(0)`
+is all ones, `x.urem(0)` is `x`, and signed division by zero is all ones for a non-negative
+dividend and `1` otherwise. `srem` takes the sign of the **dividend** - C's `%`, not `bvsmod`'s
+sign of the divisor.
+
+Shifts come in two flavours: `shl`/`lshr`/`ashr` shift by a **constant**, and the `_var` forms by a
+**symbolic** amount. Shifting at or past the width empties the value (zero-fill, or sign-fill for
+`ashr_var`) - a shift is not a rotate. Rotates come in the same two flavours (`rotl`/`rotr`,
+`rotl_var`/`rotr_var`): a constant rotate is a pure re-indexing of the bits, no gates at all, and
+a symbolic one is free when the width is a power of two and costs a divider otherwise (see
+**Cost**).
+
+When the solver finds a model, `Model::get("x")` reads the value back as a `u64` - or `None` if
+no variable by that name was ever declared.
+
+## Working with the solver
+
+`Solver::depends_on(&bv, "mem")` answers a question a caller asks constantly: did this value
 actually derive from the data read out of the input, or is it still something the caller started
 with? Name variables by origin (`mem...`, `init_...`) and the prefix tells you which.
 
@@ -52,80 +61,79 @@ constraints, without re-blasting the background. A symbolic-execution sweep asse
 once, then fires per-path queries against it; `var` and `assert` invalidate the cached blast, so
 later declarations still read back in the model.
 
-## What it deliberately does not do
+## Where it stops
 
-- **Arrays, uninterpreted functions, or quantifiers.** This is QF_BV only.
-- **`bvsmod`**, whose remainder takes the sign of the *divisor*. `srem` gives C's `%`, which is
-  what compiled code actually emits.
-- **Overflow-detection builtins** (`bvuaddo`, `bvsaddo`, ...). Derive them from the primitives:
-  `x.add(&y).ult(&x)` is the unsigned-add overflow test.
-- **Widths above 64 bits** - a model is read back as a `u64`, so 64 is the ceiling. It is
-  *enforced*, not merely documented: building a value wider than that, or combining two of
-  different widths, panics rather than quietly blasting the wrong bits. Every method whose
-  inputs have to satisfy something says so under `# Panics`.
-- **An SMT-LIB front-end.** The name invites the assumption; the API is Rust only, there is no
-  textual parser and no solver-on-a-pipe protocol.
+QF_BV means QF_BV: no arrays, no uninterpreted functions, no quantifiers. A formula that needs
+them needs a different tool.
 
-Formulas are also **single-threaded**: a `Bv` is an `Rc`-shared node, so neither `Bv` nor `Solver`
-is `Send`/`Sync`.
+There is no SMT-LIB front-end. The name invites the assumption, so it is worth saying outright:
+the API is Rust only, no textual parser, no solver-on-a-pipe protocol.
+
+Widths top out at 64 bits because a model reads back as a `u64`. That ceiling is enforced with
+panics, not documented as a trap for the caller - see above.
+
+`bvsmod` is not included, because its remainder takes the sign of the divisor and `srem` gives
+C's `%`, which is what compiled code actually emits. Overflow-detection builtins (`bvuaddo`,
+`bvsaddo`, ...) are not included either; `x.add(&y).ult(&x)` is the unsigned-add overflow test.
+
+Formulas are single-threaded: a `Bv` is an `Rc`-shared node, so neither `Bv` nor `Solver` is
+`Send`/`Sync`.
 
 ## Cost
 
-Bit-blasting is where the formula size lives, and it is not uniform across operations:
+Bit-blasting is where the formula size lives, and operations do not cost the same:
 
 | Operation (at width `w`) | Rough cost |
 |---|---|
 | constant rotate | **free** - pure re-indexing, no gates, no clauses |
-| bitwise, constant shifts, extend/extract/concat | `O(w)` literals |
-| `add`/`sub`, comparisons, `ite` | `O(w)` gates, 2-4 clauses each |
-| `mul` | `O(w²)` |
-| symbolic shift | `O(w log w)` - a barrel shifter |
-| `div`/`rem` | `O(w²)`, a restoring divider |
+| bitwise, constant shifts, extend/extract/concat | O(w) literals |
+| `add`/`sub`, comparisons, `ite` | O(w) gates, 2-4 clauses each |
+| `mul` | O(w^2) |
+| symbolic shift | O(w log w) - a barrel shifter |
+| `div`/`rem` | O(w^2), a restoring divider |
 
-So every operation at 32 bits lands under the default clause cap, but a **64-bit division reaches
-~110,000 clauses** and needs the cap raised deliberately - see below. A symbolic rotate at a
+Every operation at 32 bits fits under the default clause cap. A 64-bit division reaches about
+110,000 clauses and needs the cap raised deliberately - see below. A symbolic rotate at a
 power-of-two width never divides (the low bits of the amount already are the amount modulo the
 width); at any other width it needs a divider as wide as its *amount*, so a 64-bit amount against
-a 5-bit vector is the expensive combination, while a 5-bit amount is trivial.
+a 5-bit vector is the expensive combination.
 
 ## How it works
 
-`Bv` values form an `Rc`-shared expression DAG; a value used twice is one subgraph, not two. On
-`check`, the DAG is bit-blasted - each bit of each node becomes a SAT literal, operations encoded
-through Tseitin gates, arithmetic through ripple-carry adders, unsigned comparison through the
-carry-out of `a + ¬b + 1`, division through a restoring divider (whose per-step adder yields the
-subtraction and the `rem >= b` test in one pass), and symbolic shifts and rotates through barrel
-shifters. Bitvectors are little-endian (index 0 is the least-significant bit). Shared subgraphs are
-memoised on the `Rc` pointer, so a value appearing in several constraints is encoded once.
+`Bv` values form an `Rc`-shared expression DAG: a value used twice is one subgraph, not two. On
+`check`, the DAG is bit-blasted - each bit of each node becomes a SAT literal. Operations are
+encoded through Tseitin gates, arithmetic through ripple-carry adders, unsigned comparison
+through the carry-out of `a + ~b + 1`, division through a restoring divider (whose per-step adder
+yields the subtraction and the `rem >= b` test in one pass), and symbolic shifts and rotates
+through barrel shifters. Bitvectors are little-endian (index 0 is the least-significant bit).
+Shared subgraphs are memoised on the `Rc` pointer, so a value appearing in several constraints is
+encoded once.
 
 CNF clauses are arena-allocated (`bumpalo`): a query produces thousands of tiny, same-lifetime
 clauses, so one arena reset frees the whole formula instead of freeing clause-by-clause.
 
 The SAT core is iterative DPLL with two-watched-literal unit propagation and chronological
 branch-and-flip backtracking. Before the search, one assignment-free pass drops tautological and
-duplicate clauses and lets unit clauses force their literal. Branching prefers the unassigned
-variable with the most conflict activity (VSIDS) and tries its last-assigned value first (phase
-saving). Correctness is preferred over raw speed, because the formulas a directed query produces
-are small - hundreds to a few thousand clauses, with division the notable exception (see **Cost**
-above).
+duplicate clauses and lets unit clauses force their literal. Branching then prefers the
+unassigned variable with the most conflict activity (VSIDS) and tries its last-assigned value
+first (phase saving). Correctness is preferred over raw speed, because the formulas a directed
+query produces are small - hundreds to a few thousand clauses, with division the notable
+exception (see **Cost** above).
 
 ## Bounded by construction
 
-A solver embedded in a batch job must never hang it. Three guards, all of which degrade to
+A solver embedded in a batch job must never hang it. Three guards, and each degrades to
 `Solution::Unknown` - "not proven either way" - rather than stalling:
 
-- a **decision budget** (`check_with_budget`, `check_all_with_budget`),
-- a **wall-clock deadline** (`check_all_within`), because a propagation-heavy formula can burn
-  seconds between decisions, making a decision count a poor time proxy - the deadline is checked
-  both between decisions and within unit propagation, so it bounds a query rather than a decision
-  count,
-- a **formula-size cap** (40,000 clauses by default): past that the instance is pathological and is
-  better left to a manual walk-through than allowed to stall a sweep. Every operation at 32 bits
-  fits under it; raise it with `Solver::with_max_clauses` for a 64-bit division, and pair that with
-  a deadline.
+- a **decision budget** (`check_with_budget`, `check_all_with_budget`);
+- a **wall-clock deadline** (`check_all_within`), checked both between decisions and inside unit
+  propagation, because a propagation-heavy formula can burn seconds between decisions and a
+  decision count is a poor time proxy;
+- a **formula-size cap** (40,000 clauses by default). Every operation at 32 bits fits under it;
+  raise it with `Solver::with_max_clauses` for a 64-bit division, and pair that with a deadline.
 
-`Solution::Unknown` is never a silent "unsat" - the three outcomes stay distinct so a caller can
-tell a refutation from a timeout.
+`Unknown` is never a silent "unsat": the three outcomes stay distinct, so a caller can tell a
+refutation from a timeout.
 
 ## Requirements
 
