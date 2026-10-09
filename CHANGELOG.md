@@ -5,6 +5,33 @@ All notable changes to smtlite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.10] - 2026-10-09
+
+### Changed
+
+- **The conformance suite now proves the circuits, not the folder.** Operand constants fold on
+  construction, so the operation tables in `tests/ops.rs` were proving a folded constant against
+  a folded constant - correct, but no circuit ever reached the blaster (the 64-bit divider test
+  even raised the formula cap for a formula that was never built). Each operand is now pinned
+  into a fresh variable by an equality constraint, so every proof bit-blasts the operation's
+  real circuit: the SAT half shows it can equal the oracle value and the UNSAT half refutes any
+  difference. Every proof also asserts the expression it sends to the solver is still symbolic,
+  so a regression back to folded constants fails loudly instead of passing vacuously.
+- **Coverage is measured, not assumed.** Tests inside the blaster pin the clause counts of the
+  wide circuits - a 64-bit divider is 108,160 clauses, the signed one 114,756, a 64-bit
+  multiplier 75,872 - and a companion test shows the same division on constant operands blasts
+  zero clauses. An end-to-end guard requires a pinned 64-bit division under the default cap to
+  answer `Unknown` (the formula exceeds the cap), which the folded failure mode could not do.
+- **Constant-folding semantics are tested as their own layer.** The folder is checked
+  exhaustively against Rust's operators at width 4 - arithmetic and all ten comparisons - plus
+  shifts and rotates at widths 4 and 7, directly via `as_const` with no solver involved, and
+  labeled as folding coverage rather than circuit conformance.
+- **Wider circuit coverage.** New edge tables for 64-bit signed division and remainder, 64-bit
+  symbolic shifts and rotates, and 64-bit signed comparisons - operations that previously had
+  no test whose operands survived folding. The suite runs 39 conformance tests (from 31), 10.7 s
+  in debug and 2.3 s in release; the 64-bit division tables dominate, which is the dividers
+  themselves being built and refuted.
+
 ## [0.1.9] - 2026-10-08
 
 ### Changed

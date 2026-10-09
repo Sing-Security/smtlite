@@ -599,3 +599,77 @@ fn rot_const(a: &[i32], k: u32, left: bool) -> Vec<i32> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bv::Node;
+
+    /// A symbolic operand: a `Var` node, the shape every conformance proof must keep.
+    fn var(w: u32, id: usize) -> Bv {
+        Bv::wrap(Node::Var(w, id))
+    }
+
+    /// How many clauses blasting `bv` emits, not counting the blaster's pinned-true unit.
+    ///
+    /// This is the direct measurement behind the coverage guards in tests/ops.rs: an operation
+    /// on symbolic operands must produce a circuit of this order, while the same operation on
+    /// constant operands folds at construction and produces none of it.
+    fn circuit_size(bv: &Bv) -> usize {
+        let bump = bumpalo::Bump::new();
+        let mut b = Blaster::new(&bump);
+        b.encode(bv);
+        b.cnf.clauses.len() - 1
+    }
+
+    #[test]
+    fn symbolic_operands_generate_the_real_circuits() {
+        let (x, y) = (var(64, 0), var(64, 1));
+
+        let measured: [(&str, usize); 7] = [
+            ("udiv64", circuit_size(&x.udiv(&y))),
+            ("sdiv64", circuit_size(&x.sdiv(&y))),
+            ("mul64", circuit_size(&x.mul(&y))),
+            ("shl_var64", circuit_size(&x.shl_var(&y))),
+            ("rot_var64", circuit_size(&x.rotl_var(&y))),
+            ("sgt64", circuit_size(&x.sgt(&y))),
+            (
+                "rot_var5 (modulo-divider path)",
+                circuit_size(&var(5, 0).rotl_var(&var(5, 1))),
+            ),
+        ];
+        for (name, n) in &measured {
+            println!("{name}: {n} clauses");
+        }
+
+        // Floors at well under half the measured size: enough to catch a circuit vanishing
+        // into a fold, loose enough not to churn on innocent encoding tweaks. A drop to a
+        // handful of clauses would mean the operands folded and nothing was encoded.
+        for (name, n) in measured {
+            let floor = match name {
+                "udiv64" => 50_000,
+                "sdiv64" => 50_000,
+                "mul64" => 35_000,
+                "shl_var64" => 2_000,
+                "rot_var64" => 1_500,
+                "sgt64" => 500,
+                "rot_var5 (modulo-divider path)" => 400,
+                _ => unreachable!(),
+            };
+            assert!(
+                n >= floor,
+                "{name} blasted only {n} clauses (floor {floor}) - did the operands fold?"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_operands_fold_to_no_circuit_at_all() {
+        // The failure mode the conformance suite guards against: the same wide operation on
+        // constant operands folds at construction and blasts nothing - a "proof" over it
+        // would assert a constant against a constant.
+        let folded = Bv::val(u64::MAX, 64).udiv(&Bv::val(7, 64));
+        assert!(folded.as_const().is_some());
+        assert_eq!(circuit_size(&folded), 0);
+    }
+}
