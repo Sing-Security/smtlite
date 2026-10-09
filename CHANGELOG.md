@@ -5,6 +5,19 @@ All notable changes to smtlite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] - 2026-10-08
+
+### Changed
+
+- **The query bounds now cover the whole query, not just the search.** The wall-clock deadline
+  and the formula-size cap take effect from API entry: the blaster checks the deadline while it
+  encodes (memoising width-correct dummies once a bound trips, so the caller bails to `Unknown`
+  before any solve sees them) and the cap stops clause generation at the limit instead of
+  rejecting the finished formula. The cached background blast is bounded the same way, an
+  over-cap background is remembered so later checks answer instantly, and `preprocess` checks
+  the clock per clause. Results are unchanged - the fix removes wasted work, it does not change
+  any verdict: an elapsed deadline still means `Unknown`, never a verdict.
+
 ## [0.1.8] - 2026-10-08
 
 ### Changed

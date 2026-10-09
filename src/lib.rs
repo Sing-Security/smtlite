@@ -31,7 +31,11 @@
 //!
 //! Three bounds, any of which yields [`Solution::Unknown`] rather than a wrong verdict:
 //! [`Solver::check_with_budget`] caps decisions, [`Solver::check_all_within`] adds a
-//! wall-clock deadline, and [`Solver::with_max_clauses`] caps the formula size.
+//! wall-clock deadline, and [`Solver::with_max_clauses`] caps the formula size. The bounds are
+//! best-effort - checked periodically, not preemptively, so they bound the work rather than the
+//! latency to the microsecond - but they cover the whole query, from API entry to return: the
+//! deadline and the clause cap govern the bit-blast that produces the CNF, not only the search
+//! over it.
 //!
 //! # Width and threading limits
 //!
@@ -59,13 +63,12 @@ use sat::SatResult::{Sat, Unknown, Unsat};
 /// Default decision budget before a query degrades to [`Solution::Unknown`].
 const DEFAULT_BUDGET: u64 = 4_000_000;
 
-/// Default formula-size cap: a blasted formula larger than this is [`Solution::Unknown`] without
-/// being solved at all.
+/// Default formula-size cap: the blaster stops generating clauses at this count, and a formula
+/// that would exceed it is [`Solution::Unknown`] without being solved at all.
 ///
-/// `propagate` rescans every clause per fixpoint, so a huge circuit can burn minutes at a low
-/// *decision* count. Every operation at 32 bits fits; a **64-bit division needs roughly
-/// 110,000 clauses**, so a caller that needs one raises the cap via
-/// [`Solver::with_max_clauses`].
+/// Every operation at 32 bits fits; a **64-bit division needs roughly 110,000 clauses**, so a
+/// caller that needs one raises the cap via [`Solver::with_max_clauses`], paired with a
+/// wall-clock deadline.
 const DEFAULT_MAX_CLAUSES: usize = 40_000;
 
 /// The answer to a satisfiability query, three-valued.
@@ -82,7 +85,7 @@ pub enum Solution {
     /// Unsatisfiable - no assignment satisfies the constraints, proven within the bounds.
     Unsat,
     /// No verdict: the decision budget, the wall-clock deadline, or the clause cap was reached
-    /// before the search finished.
+    /// before the query finished - during blasting, preprocessing, or the search itself.
     ///
     /// There is no partial model to salvage. Raise the bound that was hit
     /// ([`Solver::check_with_budget`], [`Solver::check_all_within`],
@@ -96,7 +99,7 @@ pub struct Solver {
     vars: Vec<(String, u32)>,
     asserts: Vec<Bv>,
     max_clauses: usize,
-    cache: RefCell<Option<Cache>>,
+    cache: RefCell<Option<CacheState>>,
 }
 
 /// The blasted background of the stored constraints, kept so the per-path entry points can reuse
@@ -107,6 +110,20 @@ struct Cache {
     clauses: Vec<Vec<i32>>,
     nvars: usize,
     var_bits: HashMap<usize, Vec<i32>>,
+}
+
+/// The state of the cached background blast.
+///
+/// `None` at the `Option` level means there is nothing to reuse: either no blast has been
+/// attempted yet, or the last attempt ran out of deadline - in both cases the next solve
+/// rebuilds. [`Oversize`](CacheState::Oversize) is different: the stored constraints exceed the
+/// clause cap, and since the cap never changes on its own, every solve against them answers
+/// [`Solution::Unknown`] without re-blasting. `var` and `assert` reset the field to `None`, so a
+/// mutation clears the marker along with any stale blast.
+#[derive(Debug)]
+enum CacheState {
+    Ready(Cache),
+    Oversize,
 }
 
 impl Default for Solver {
@@ -287,7 +304,9 @@ impl Solver {
     }
 
     /// [`check_assumptions_with_budget`](Self::check_assumptions_with_budget) plus a wall-clock
-    /// `deadline`.
+    /// `deadline`, covering the whole query: the (cached) blast of the background, the blast of
+    /// the assumptions, and the search itself. A background whose first blast the deadline cut
+    /// short is rebuilt on the next call, so one slow build does not poison later queries.
     #[must_use]
     pub fn check_assumptions_within(
         &self,
@@ -324,7 +343,8 @@ impl Solver {
     ///
     /// The budget bounds decisions, not time. A batch that has to finish inside a wall-clock
     /// bound passes a deadline here, so the slowest query degrades rather than stalling the
-    /// rest.
+    /// rest. The deadline covers the whole query - the blast of the constraints, the
+    /// preprocessing pass, and the search - not just the search.
     #[must_use]
     pub fn check_all_within(
         &self,
@@ -345,6 +365,10 @@ impl Solver {
         // `Model` we hand back copies its bits out, so it never borrows the arena.
         let bump = bumpalo::Bump::new();
         let mut b = Blaster::new(&bump);
+        // The deadline and the clause cap bound the blast itself, not only the search: once
+        // either trips, the blaster hands back dummy literals and stops emitting clauses.
+        b.deadline = deadline;
+        b.cnf.cap = Some(self.max_clauses);
         // Every declared variable gets its SAT bits up front, so a model is total over the
         // declaration: `Model::get` reads back a variable no constraint happened to mention.
         for (id, (_, width)) in self.vars.iter().enumerate() {
@@ -353,7 +377,14 @@ impl Solver {
         for c in constraints {
             b.assert_true(c);
         }
-        if b.cnf.clauses.len() > self.max_clauses {
+        // A bound tripped during the blast leaves dummy literals in the formula, so bail to
+        // Unknown before the solver can see them. The count check is not redundant with `full`:
+        // the pinned-true clause predates the cap being set, so a zero cap alone never trips
+        // `full` (and `full` implies exactly `cap` clauses, so it would miss a truncation).
+        if b.cnf.full
+            || b.cnf.clauses.len() > self.max_clauses
+            || deadline.is_some_and(|d| std::time::Instant::now() >= d)
+        {
             return Solution::Unknown;
         }
         match b.cnf.solve_within(budget, deadline) {
@@ -373,15 +404,27 @@ impl Solver {
         budget: u64,
         deadline: Option<std::time::Instant>,
     ) -> Solution {
-        self.ensure_cache();
+        // Build (or reuse) the cached blast under the same bounds. An over-cap background or a
+        // deadline cut short both answer Unknown here; the latter leaves nothing cached, so the
+        // next call retries the build.
+        if !self.ensure_cache(deadline) {
+            return Solution::Unknown;
+        }
         let cache = self.cache.borrow();
-        let cache = cache.as_ref().expect("the cache was just built");
+        let cache = match cache.as_ref() {
+            Some(CacheState::Ready(cache)) => cache,
+            _ => return Solution::Unknown,
+        };
 
         // A fresh arena and blaster for this call's clauses. Seed it with the background's
         // literals for every declared variable and continue the variable counter after them, so
-        // the assumption gates never collide with the cached bits.
+        // the assumption gates never collide with the cached bits. The per-call cap is whatever
+        // headroom the background left, so the two blasts together respect the cap, and the
+        // per-call deadline bounds this blast just as it bound the background's.
         let bump = bumpalo::Bump::new();
         let mut b = Blaster::new(&bump);
+        b.deadline = deadline;
+        b.cnf.cap = Some(self.max_clauses.saturating_sub(cache.clauses.len()));
         b.var_bits = cache.var_bits.clone();
         b.cnf.nvars = cache.nvars;
         for c in assumptions {
@@ -392,7 +435,13 @@ impl Solver {
         let mut clauses: Vec<&[i32]> = cache.clauses.iter().map(|c| c.as_slice()).collect();
         clauses.extend(b.cnf.clauses.iter().copied());
 
-        if clauses.len() > self.max_clauses {
+        // A bound tripped during the assumption blast leaves dummy literals in the clauses, so
+        // bail to Unknown before the solver can see them; the count check catches a background
+        // that alone exactly fills the cap, leaving the assumption blast no headroom.
+        if b.cnf.full
+            || clauses.len() > self.max_clauses
+            || deadline.is_some_and(|d| std::time::Instant::now() >= d)
+        {
             return Solution::Unknown;
         }
         match sat::solve(&clauses, b.cnf.nvars, budget, deadline) {
@@ -406,29 +455,57 @@ impl Solver {
         }
     }
 
-    /// Build the cached blast of the stored constraints if it is not already there.
-    fn ensure_cache(&self) {
+    /// Build the cached blast of the stored constraints if it is not already there, bounding the
+    /// build by `deadline`.
+    ///
+    /// Returns whether a usable cache is in place. `false` means either the background exceeds
+    /// the clause cap - remembered as [`Oversize`](CacheState::Oversize), so every later call
+    /// answers the same way without re-blasting - or the deadline cut the build short, which is
+    /// remembered as nothing, so the next call (with a fresh deadline, say) retries it.
+    fn ensure_cache(&self, deadline: Option<std::time::Instant>) -> bool {
         let mut cache = self.cache.borrow_mut();
         if cache.is_none() {
-            *cache = Some(self.blast_background());
+            let (built, over) = self.blast_background(deadline);
+            if over {
+                *cache = Some(CacheState::Oversize);
+                return false;
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                // The deadline cut the build short: do not cache a formula full of dummy
+                // literals, and do not remember the failure either - retrying is cheap and
+                // correct, while a poisoned cache would fail every later query.
+                return false;
+            }
+            *cache = Some(CacheState::Ready(built));
+            return true;
         }
+        matches!(cache.as_ref(), Some(CacheState::Ready(_)))
     }
 
-    /// Blast the stored constraints once, copying the clauses out of the arena so they outlive it.
-    fn blast_background(&self) -> Cache {
+    /// Blast the stored constraints once, copying the clauses out of the arena so they outlive
+    /// it. The `bool` reports whether the build was cut off: the clause cap tripped (`full`), or
+    /// the count exceeds it - the pinned-true clause predates the cap being set, so a zero cap
+    /// needs the count, not `full`.
+    fn blast_background(&self, deadline: Option<std::time::Instant>) -> (Cache, bool) {
         let bump = bumpalo::Bump::new();
         let mut b = Blaster::new(&bump);
+        b.deadline = deadline;
+        b.cnf.cap = Some(self.max_clauses);
         for (id, (_, width)) in self.vars.iter().enumerate() {
             b.declare_var(id, *width);
         }
         for c in &self.asserts {
             b.assert_true(c);
         }
-        Cache {
-            clauses: b.cnf.clauses.iter().map(|c| c.to_vec()).collect(),
-            nvars: b.cnf.nvars,
-            var_bits: b.var_bits,
-        }
+        let over = b.cnf.full || b.cnf.clauses.len() > self.max_clauses;
+        (
+            Cache {
+                clauses: b.cnf.clauses.iter().map(|c| c.to_vec()).collect(),
+                nvars: b.cnf.nvars,
+                var_bits: b.var_bits,
+            },
+            over,
+        )
     }
 
     fn name_to_id(&self) -> HashMap<String, usize> {

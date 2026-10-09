@@ -109,6 +109,50 @@ fn an_elapsed_deadline_yields_unknown_not_unsat() {
 }
 
 #[test]
+fn an_elapsed_deadline_covers_the_background_blast_and_does_not_poison_it() {
+    // A 64-bit multiply is a large blast. An already-elapsed deadline must cut it off in the
+    // encode phase - Unknown before any search - and the same solver with a fresh deadline must
+    // then complete the same build, proving a deadline-bailed cache build is retried, not
+    // remembered as a failure.
+    let mut s = Solver::new().with_max_clauses(200_000);
+    let x = s.var("x", 64);
+    let y = s.var("y", 64);
+    s.assert(x.mul(&y).eq(&Bv::val(6, 64)));
+
+    let past = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
+    assert!(matches!(
+        s.check_assumptions_within(&[], 1_000_000, past),
+        Solution::Unknown
+    ));
+
+    let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    match s.check_assumptions_within(&[], 1_000_000, far) {
+        Solution::Sat(m) => {
+            // The rebuilt blast is the real formula: the model's x*y really is 6.
+            let (v, w) = (m.get("x").unwrap(), m.get("y").unwrap());
+            assert_eq!(v.wrapping_mul(w), 6, "model {v} * {w} != 6");
+        }
+        other => panic!("expected SAT with a fresh deadline, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_over_cap_background_answers_unknown_on_every_check() {
+    // The over-cap background is remembered as oversize, so repeated checks answer Unknown
+    // without re-blasting the same too-large formula each time.
+    let mut s = Solver::new().with_max_clauses(8);
+    let x = s.var("x", 8);
+    let y = s.var("y", 8);
+    s.assert(x.mul(&y).eq(&Bv::val(6, 8))); // an 8-bit mul alone is far over the cap
+
+    for _ in 0..3 {
+        assert!(matches!(s.check(), Solution::Unknown));
+    }
+}
+
+#[test]
 fn check_all_ignores_stored_asserts_and_does_not_mutate_them() {
     let mut s = Solver::new();
     let x = s.var("x", 8);
@@ -245,6 +289,44 @@ fn assumption_models_read_back_background_only_variables() {
             );
         }
         other => panic!("expected SAT, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_incremental_path_matches_check_all_on_the_same_formula() {
+    // The incremental path (stored background ++ assumptions) and the one-shot path (`check_all`)
+    // do not blast identical clause sets - the assumption blaster works from a fresh memo and
+    // re-encodes shared subgraphs as fresh Tseitin gates - but the two are equisatisfiable and
+    // must agree on the verdict. The models agree on the declared variables only because the
+    // background pins every one of them, so the test asserts the verdict kind plus the pinned
+    // readbacks, not raw model equality.
+    let mut inc = Solver::new();
+    let x = inc.var("x", 8);
+    let y = inc.var("y", 8);
+    inc.assert(x.eq(&Bv::val(0x2a, 8))); // background pins x and y
+    inc.assert(y.eq(&Bv::val(0x77, 8)));
+
+    let mut direct = Solver::new();
+    let dx = direct.var("x", 8);
+    let dy = direct.var("y", 8);
+    let whole_formula = [
+        dx.eq(&Bv::val(0x2a, 8)),
+        dy.eq(&Bv::val(0x77, 8)),
+        dx.add(&dy).eq(&Bv::val(0x2a + 0x77, 8)),
+    ];
+
+    match (
+        inc.check_assumptions(&[x.add(&y).eq(&Bv::val(0x2a + 0x77, 8))]),
+        direct.check_all(&whole_formula),
+    ) {
+        (Solution::Sat(ma), Solution::Sat(md)) => {
+            assert_eq!(ma.get("x"), Some(0x2a));
+            assert_eq!(ma.get("y"), Some(0x77));
+            assert_eq!(md.get("x"), Some(0x2a));
+            assert_eq!(md.get("y"), Some(0x77));
+        }
+        (Solution::Unsat, Solution::Unsat) => {}
+        (a, b) => panic!("the two paths disagreed: {a:?} vs {b:?}"),
     }
 }
 

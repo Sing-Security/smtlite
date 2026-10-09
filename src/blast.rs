@@ -5,9 +5,14 @@
 //! carry-out of `a + ¬b + 1` (which is 1 iff `a ≥ b`). Shared subgraphs are memoised on the
 //! `Rc` pointer so a value used twice is encoded once. Bit vectors are little-endian:
 //! index 0 is the least-significant bit.
+//!
+//! A wall-clock deadline and a clause cap bound the blast itself, not only the search over its
+//! result: once either trips, [`Blaster::encode`] hands back width-correct dummy literals
+//! instead of clauses, and the caller bails to `Unknown` before any solve sees them.
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Instant;
 
 use crate::bv::{Bv, Cmp, Node, Op};
 use crate::sat::Cnf;
@@ -18,6 +23,9 @@ pub(crate) struct Blaster<'b> {
     memo: HashMap<usize, Vec<i32>>,
     /// Bit literals for each named variable id, so a model can be read back.
     pub var_bits: HashMap<usize, Vec<i32>>,
+    /// Optional wall-clock deadline checked while blasting, so the encode phase degrades to
+    /// dummies instead of burning unbounded time before the search's own deadline check.
+    pub deadline: Option<Instant>,
 }
 
 impl<'b> Blaster<'b> {
@@ -30,7 +38,15 @@ impl<'b> Blaster<'b> {
             true_lit,
             memo: HashMap::new(),
             var_bits: HashMap::new(),
+            deadline: None,
         }
+    }
+
+    /// Has the wall-clock deadline elapsed? Callers must treat an over-the-clock blaster as
+    /// producing garbage: its results are width-correct dummy literals, to be bailed out of
+    /// before any solve sees them.
+    fn over(&self) -> bool {
+        self.deadline.is_some_and(|d| Instant::now() >= d)
     }
 
     fn t(&self) -> i32 {
@@ -110,12 +126,22 @@ impl<'b> Blaster<'b> {
     }
 
     /// Encode a value to its bit literals (LSB first).
+    ///
+    /// This is the memoization entry every node routes through, so it is also where the bounds
+    /// take effect: once the deadline has elapsed or the clause cap has cut generation off, the
+    /// blaster hands back width-correct pinned-false dummies instead of encoding. Dummies are
+    /// memoised like any result, and every caller bails to `Unknown` before a solve, so they
+    /// never reach the solver.
     pub fn encode(&mut self, bv: &Bv) -> Vec<i32> {
         let key = Rc::as_ptr(&bv.0) as usize;
         if let Some(bits) = self.memo.get(&key) {
             return bits.clone();
         }
-        let bits = self.encode_node(bv);
+        let bits = if self.over() || self.cnf.full {
+            vec![self.f(); bv.width() as usize]
+        } else {
+            self.encode_node(bv)
+        };
         self.memo.insert(key, bits.clone());
         bits
     }
@@ -277,6 +303,10 @@ impl<'b> Blaster<'b> {
         let w = a.len();
         let mut acc = vec![self.f(); w];
         for (j, &bj) in b.iter().enumerate() {
+            // One outer iteration emits O(w) clauses, so the deadline is worth a look here.
+            if self.over() {
+                return vec![self.f(); w];
+            }
             let mut partial = vec![self.f(); w];
             for i in 0..(w - j) {
                 partial[i + j] = self.and(a[i], bj);
@@ -344,6 +374,12 @@ impl<'b> Blaster<'b> {
         let not_b: Vec<i32> = bext.iter().map(|&l| -l).collect();
         let mut quot = vec![self.f(); w];
         for i in (0..w).rev() {
+            // One division step emits O(w) clauses, so the deadline is worth a look here. The
+            // dummies match the *return* width - two w-bit vectors - not the internal w+1: a
+            // w+1 remainder would blow the index arithmetic of callers like `srem_bits`.
+            if self.over() {
+                return (vec![self.f(); w], vec![self.f(); w]);
+            }
             // Fold the next dividend bit in. Little-endian, so it is *less* significant than
             // everything in `rem`: index 0, the rest slides up - `rem << 1 | a[i]` reversed.
             let mut shifted = Vec::with_capacity(w + 1);
@@ -404,6 +440,10 @@ impl<'b> Blaster<'b> {
         let stages = shift_stages(w);
         let mut cur = a.to_vec();
         for j in 0..stages {
+            // One barrel stage emits O(w) clauses, so the deadline is worth a look here.
+            if self.over() {
+                return vec![f; w];
+            }
             // k narrower than the barrel: its higher bits are zero, so those stages never fire.
             let Some(&sel) = k.get(j) else { break };
             let sh = 1usize << j;
@@ -490,6 +530,10 @@ impl<'b> Blaster<'b> {
         // `amount` is exactly `stages` bits in both branches, so this walks the barrel one
         // stage at a time.
         for (j, &sel) in amount.iter().enumerate() {
+            // One barrel stage emits O(w) clauses, so the deadline is worth a look here.
+            if self.over() {
+                return vec![f; w];
+            }
             let sh = (1usize << j) % w;
             let mut rotated = Vec::with_capacity(w);
             for i in 0..w {

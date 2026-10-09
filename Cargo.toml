@@ -9,7 +9,7 @@
 # builds and publishes identically whether it is pulled in as a dependency or checked out alone.
 [package]
 name = "smtlite"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"

@@ -18,7 +18,9 @@
 //!
 //! Before the search, one assignment-free pass simplifies the clause set: a unit clause forces its
 //! literal, so clauses containing a forced literal are satisfied, the negation of a forced literal
-//! drops out of a clause, and duplicate and tautological clauses go.
+//! drops out of a clause, and duplicate and tautological clauses go. The pass checks the
+//! wall-clock deadline once per clause, so a slow cleanup degrades to `Unknown` rather than
+//! eating the deadline silently.
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -33,6 +35,12 @@ pub struct Cnf<'b> {
     pub nvars: usize,
     /// The conjunction, one clause per element, each borrowed from the arena.
     pub clauses: Vec<&'b [i32]>,
+    /// Optional clause-count cap: [`add_clause`](Self::add_clause) stops once the count reaches
+    /// it, so an over-cap formula is never generated in full.
+    pub cap: Option<usize>,
+    /// Whether clause generation was cut off at `cap`. A truncated formula must never be solved
+    /// as if it were complete, so callers bail to `Unknown` on it.
+    pub full: bool,
     /// The arena the clauses live in; kept so clauses can be allocated as they are added.
     bump: &'b bumpalo::Bump,
 }
@@ -103,6 +111,8 @@ impl<'b> Cnf<'b> {
         Self {
             nvars: 0,
             clauses: Vec::new(),
+            cap: None,
+            full: false,
             bump,
         }
     }
@@ -121,7 +131,19 @@ impl<'b> Cnf<'b> {
     /// The literals are copied into the arena, so the slice need not outlive the call. An
     /// empty clause is the empty disjunction - immediately false, and therefore the way to
     /// state "unsatisfiable" outright.
+    ///
+    /// Once the clause count reaches `cap`, the clause is dropped and `full` is set: the blast
+    /// stops generating work instead of finishing an over-cap formula. The pinned-true clause a
+    /// blaster emits in its constructor predates the cap being set, so `full` alone cannot
+    /// catch a cap of zero - callers keep a final count check as well.
     pub fn add_clause(&mut self, lits: &[i32]) {
+        if self.full {
+            return;
+        }
+        if self.cap.is_some_and(|c| self.clauses.len() >= c) {
+            self.full = true;
+            return;
+        }
         self.clauses.push(self.bump.alloc_slice_copy(lits));
     }
 
@@ -131,8 +153,14 @@ impl<'b> Cnf<'b> {
     /// total, so a propagation-heavy formula can still burn time between decisions. The deadline is
     /// therefore checked *inside* propagation, once per trail assignment, which bounds the overshoot
     /// to a single assignment's watch list.
+    ///
+    /// A formula whose clause generation was cut off at the cap answers [`SatResult::Unknown`]
+    /// without searching: a truncated formula must never be called a verdict.
     #[must_use]
     pub fn solve_within(&self, budget: u64, deadline: Option<Instant>) -> SatResult {
+        if self.full {
+            return SatResult::Unknown;
+        }
         solve(&self.clauses, self.nvars, budget, deadline)
     }
 }
@@ -149,11 +177,22 @@ impl<'b> Cnf<'b> {
 /// is reported as `None`. Nothing is assigned here, so the free-variable filter and model
 /// readback see exactly the formula the caller built. The unit clauses themselves are kept, so
 /// the forced values survive as seed assignments for the search.
-fn preprocess(clauses: &[&[i32]], nvars: usize) -> Option<Vec<Vec<i32>>> {
+///
+/// The wall-clock `deadline` is checked once per clause; on expiry the pass bails early through
+/// the same `None` channel. [`solve`] tells the two `None`s apart by the clock, so a deadline hit
+/// becomes `Unknown`, never a mistaken `Unsat`.
+fn preprocess(
+    clauses: &[&[i32]],
+    nvars: usize,
+    deadline: Option<Instant>,
+) -> Option<Vec<Vec<i32>>> {
     // What does each unit clause force? A later unit clause overwrites an earlier one; the
     // solver's own unit seeding rejects a conflicting pair, so either order is fine here.
     let mut forced = vec![None; nvars];
     for clause in clauses {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return None;
+        }
         if clause.len() == 1 {
             let lit = clause[0];
             forced[(lit.unsigned_abs() - 1) as usize] = Some(lit > 0);
@@ -163,6 +202,9 @@ fn preprocess(clauses: &[&[i32]], nvars: usize) -> Option<Vec<Vec<i32>>> {
     let mut out: Vec<Vec<i32>> = Vec::with_capacity(clauses.len());
     let mut seen: HashSet<Vec<i32>> = HashSet::new();
     for clause in clauses {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return None;
+        }
         let mut kept: Vec<i32> = Vec::with_capacity(clause.len());
         let mut satisfied = false;
         let mut tautology = false;
@@ -213,7 +255,8 @@ fn preprocess(clauses: &[&[i32]], nvars: usize) -> Option<Vec<Vec<i32>>> {
 /// The budget alone is a poor time proxy: propagation is cheap per assignment but unbounded in
 /// total, so a propagation-heavy formula can still burn time between decisions. The deadline is
 /// therefore checked *inside* propagation, once per trail assignment, which bounds the overshoot
-/// to a single assignment's watch list.
+/// to a single assignment's watch list - and inside the preprocessing pass, once per clause, so
+/// the cleanup itself cannot eat the deadline.
 #[must_use]
 pub fn solve(
     clauses: &[&[i32]],
@@ -229,16 +272,19 @@ pub fn solve(
     if clauses.iter().any(|c| c.is_empty()) {
         return SatResult::Unsat;
     }
-    // Simplify the clause set once, before any search state exists.
-    let Some(cleaned) = preprocess(clauses, nvars) else {
+    // Simplify the clause set once, before any search state exists. The pass checks the clock
+    // itself and reuses its `None` channel for a deadline hit, so consult the clock *before*
+    // mapping `None` to `Unsat`: an expired deadline must answer Unknown, never the Unsat the
+    // empty clause means.
+    let cleaned = preprocess(clauses, nvars, deadline);
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return SatResult::Unknown;
+    }
+    let Some(cleaned) = cleaned else {
         return SatResult::Unsat;
     };
     let cleaned: Vec<&[i32]> = cleaned.iter().map(Vec::as_slice).collect();
     let clauses = cleaned.as_slice();
-    // The cleanup pass does not check the clock; do not let it eat the deadline silently.
-    if deadline.is_some_and(|d| Instant::now() >= d) {
-        return SatResult::Unknown;
-    }
 
     let n = nvars;
     let mut assign: Vec<Option<bool>> = vec![None; n];

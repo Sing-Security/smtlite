@@ -126,14 +126,17 @@ A solver embedded in a batch job must never hang it. Three guards, and each degr
 `Solution::Unknown` - "not proven either way" - rather than stalling:
 
 - a **decision budget** (`check_with_budget`, `check_all_with_budget`);
-- a **wall-clock deadline** (`check_all_within`), checked both between decisions and inside unit
-  propagation, because a propagation-heavy formula can burn seconds between decisions and a
-  decision count is a poor time proxy;
-- a **formula-size cap** (40,000 clauses by default). Every operation at 32 bits fits under it;
-  raise it with `Solver::with_max_clauses` for a 64-bit division, and pair that with a deadline.
+- a **wall-clock deadline** (`check_all_within`), checked across the whole query - blasting,
+  preprocessing, and the search (including inside unit propagation, because a
+  propagation-heavy formula can burn seconds between decisions and a decision count is a poor
+  time proxy);
+- a **formula-size cap** (40,000 clauses by default) that stops clause *generation* rather than
+  rejecting the finished formula. Every operation at 32 bits fits under it; raise it with
+  `Solver::with_max_clauses` for a 64-bit division, and pair that with a deadline.
 
-`Unknown` is never a silent "unsat": the three outcomes stay distinct, so a caller can tell a
-refutation from a timeout.
+The bounds are best-effort: they are checked periodically, not preemptively, so they bound the
+work, not the latency to the microsecond. `Unknown` is never a silent "unsat": the three
+outcomes stay distinct, so a caller can tell a refutation from a timeout.
 
 ## Requirements
 
