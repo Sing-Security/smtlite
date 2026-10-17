@@ -287,6 +287,68 @@ fn udiv_urem_exhaustive_width4() {
     }
 }
 
+/// The constant-divisor arm of the blaster: division and remainder by a
+/// **literal** power of two re-index the dividend instead of building a
+/// divider. `prove2` pins the divisor as a variable (a different term shape),
+/// so the generic tests above never fire this arm; this one proves it
+/// exhaustively against Rust's arithmetic at two widths, and at 64 bits the
+/// circuit is asserted empty in `blast::tests`.
+#[test]
+fn a_power_of_two_divisor_is_a_bit_reindexing() {
+    for w in [4u32, 8] {
+        for a in 0..(1u64 << w) {
+            for k in 0..w {
+                let c = 1u64 << k;
+                let want = Bv::val(a / c, w);
+                prove_with(40_000, want, "udiv by 2^k", |s| {
+                    let x = pin(s, "x", a, w);
+                    x.udiv(&Bv::val(c, w))
+                });
+                if k == 0 {
+                    // `x % 1` is the constant zero - the one case where the
+                    // remainder folds at construction and there is no circuit
+                    // to prove against.
+                    let x = pin(&mut Solver::new(), "x", a, w);
+                    assert_eq!(x.urem(&Bv::val(1, w)).as_const(), Some(0));
+                    continue;
+                }
+                let want = Bv::val(a % c, w);
+                prove_with(40_000, want, "urem by 2^k", |s| {
+                    let x = pin(s, "x", a, w);
+                    x.urem(&Bv::val(c, w))
+                });
+            }
+        }
+    }
+}
+
+/// The zero-extension trim: when both operands carry statically-zero high
+/// bits, the divider runs at the narrow width. Proved exhaustively against
+/// Rust's arithmetic, including the zero-divisor branch (the one place the
+/// narrow circuit's SMT-LIB answer differs from the wide one).
+#[test]
+fn a_zero_extended_division_runs_at_the_narrow_width() {
+    for half in [3u32, 4] {
+        let w = 2 * half;
+        let (max, all) = (1u64 << half, (1u64 << w) - 1);
+        for a in 0..max {
+            for b in 0..max {
+                let (q, r) = if b == 0 { (all, a) } else { (a / b, a % b) };
+                prove_with(40_000, Bv::val(q, w), "zext udiv", |s| {
+                    let zero = Bv::val(0, half);
+                    let (x, y) = (pin(s, "x", a, half), pin(s, "y", b, half));
+                    zero.concat(&x).udiv(&zero.concat(&y))
+                });
+                prove_with(40_000, Bv::val(r, w), "zext urem", |s| {
+                    let zero = Bv::val(0, half);
+                    let (x, y) = (pin(s, "x", a, half), pin(s, "y", b, half));
+                    zero.concat(&x).urem(&zero.concat(&y))
+                });
+            }
+        }
+    }
+}
+
 #[test]
 fn udiv_urem_sampled_width8() {
     const VALS: [u64; 12] = [0, 1, 2, 3, 7, 8, 15, 16, 127, 128, 200, 255];

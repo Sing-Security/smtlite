@@ -6,6 +6,15 @@
 //! `Rc` pointer so a value used twice is encoded once. Bit vectors are little-endian:
 //! index 0 is the least-significant bit.
 //!
+//! Pointer sharing is not the only sharing that matters. Terms built twice from the same
+//! inputs - a caller's `x == y` and a theory lemma's `y == x`, say - are distinct `Rc`s with
+//! one meaning, and encoding them as two circuits makes the solver *prove* they agree. That
+//! is cheap for a CDCL solver and exponential for this learning-free DPLL, so the blaster
+//! also interning **structurally**: each distinct (operation, width, parameters, canonical
+//! child) shape maps to the first circuit built for it, with commutative operands normalized.
+//! Two structurally identical terms therefore share one SAT encoding, and a lemma that
+//! restates an asserted equality resolves by unit propagation instead of a search.
+//!
 //! A wall-clock deadline and a clause cap bound the blast itself, not only the search over its
 //! result: once either trips, [`Blaster::encode`] hands back width-correct dummy literals
 //! instead of clauses, and the caller bails to `Unknown` before any solve sees them.
@@ -17,10 +26,58 @@ use std::time::Instant;
 use crate::bv::{Bv, Cmp, Node, Op};
 use crate::sat::Cnf;
 
+/// The structural identity of a term: what it is made of, not which `Rc` holds it.
+///
+/// Children are canonical ids, so two terms are one shape exactly when their operands are
+/// one shape. Commutative operations are normalized by sorting their child ids, which is
+/// why `a == b` and `b == a` land on the same key.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ShapeKey {
+    tag: u8,
+    width: u32,
+    /// The leaf value, shift/rotate amount, comparison kind, or flags - meaning depends on `tag`.
+    arg: u128,
+    kids: Vec<usize>,
+}
+
+/// The `Op` discriminant for a [`ShapeKey`].
+fn op_tag(op: Op) -> u128 {
+    match op {
+        Op::And => 0,
+        Op::Or => 1,
+        Op::Xor => 2,
+        Op::Add => 3,
+        Op::Sub => 4,
+        Op::Mul => 5,
+        Op::Udiv => 6,
+        Op::Urem => 7,
+        Op::Sdiv => 8,
+        Op::Srem => 9,
+    }
+}
+
+/// The `Cmp` discriminant for a [`ShapeKey`].
+fn cmp_tag(cmp: Cmp) -> u128 {
+    match cmp {
+        Cmp::Eq => 0,
+        Cmp::Ne => 1,
+        Cmp::Ult => 2,
+        Cmp::Ule => 3,
+        Cmp::Slt => 4,
+        Cmp::Sle => 5,
+    }
+}
+
 pub(crate) struct Blaster<'b> {
     pub cnf: Cnf<'b>,
     true_lit: i32,
     memo: HashMap<usize, Vec<i32>>,
+    /// Canonical id per `Rc` pointer: the structural dedup cache for term shapes.
+    canon: HashMap<usize, usize>,
+    /// The intern table: one canonical id per distinct [`ShapeKey`].
+    shapes: HashMap<ShapeKey, usize>,
+    /// Bit literals per canonical id: the circuit-sharing cache.
+    struct_memo: HashMap<usize, Vec<i32>>,
     /// Bit literals for each named variable id, so a model can be read back.
     pub var_bits: HashMap<usize, Vec<i32>>,
     /// Optional wall-clock deadline checked while blasting, so the encode phase degrades to
@@ -37,6 +94,9 @@ impl<'b> Blaster<'b> {
             cnf,
             true_lit,
             memo: HashMap::new(),
+            canon: HashMap::new(),
+            shapes: HashMap::new(),
+            struct_memo: HashMap::new(),
             var_bits: HashMap::new(),
             deadline: None,
         }
@@ -66,7 +126,111 @@ impl<'b> Blaster<'b> {
         self.var_bits.insert(id, bits);
     }
 
+    /// The canonical id of a term's shape, interning it on first sight.
+    ///
+    /// The traversal is cached per `Rc` pointer, so a shared DAG is walked once. Children
+    /// are canonicalized first, which is what makes the key structural rather than
+    /// pointer-identity; commutative operands are sorted so `a == b` and `b == a` intern
+    /// to one id.
+    fn canon_id(&mut self, bv: &Bv) -> usize {
+        let ptr = Rc::as_ptr(&bv.0) as usize;
+        if let Some(&id) = self.canon.get(&ptr) {
+            return id;
+        }
+        let width = bv.width();
+        let (tag, arg, kids) = match &*bv.0 {
+            Node::Const(_, v) => (0, *v, Vec::new()),
+            Node::Var(_, id) => (1, *id as u128, Vec::new()),
+            Node::Not(x) => (2, 0, vec![self.canon_id(x)]),
+            Node::Neg(x) => (3, 0, vec![self.canon_id(x)]),
+            Node::Bin(op, x, y) => {
+                let (mut l, mut r) = (self.canon_id(x), self.canon_id(y));
+                if matches!(op, Op::And | Op::Or | Op::Xor | Op::Add | Op::Mul) && l > r {
+                    std::mem::swap(&mut l, &mut r);
+                }
+                (4, op_tag(*op), vec![l, r])
+            }
+            Node::ShlC(x, k) => (5, *k as u128, vec![self.canon_id(x)]),
+            Node::ShrC(x, k, arith) => (
+                6,
+                (*k as u128) | ((u128::from(*arith)) << 32),
+                vec![self.canon_id(x)],
+            ),
+            Node::ShlV(x, k) => (7, 0, vec![self.canon_id(x), self.canon_id(k)]),
+            Node::ShrV(x, k, arith) => (
+                8,
+                u128::from(*arith),
+                vec![self.canon_id(x), self.canon_id(k)],
+            ),
+            Node::RotC(x, k, left) => (
+                9,
+                (*k as u128) | ((u128::from(*left)) << 32),
+                vec![self.canon_id(x)],
+            ),
+            Node::RotV(x, k, left) => (
+                10,
+                u128::from(*left),
+                vec![self.canon_id(x), self.canon_id(k)],
+            ),
+            Node::Compare(cmp, x, y) => {
+                let (mut l, mut r) = (self.canon_id(x), self.canon_id(y));
+                if matches!(cmp, Cmp::Eq | Cmp::Ne) && l > r {
+                    std::mem::swap(&mut l, &mut r);
+                }
+                (11, cmp_tag(*cmp), vec![l, r])
+            }
+            Node::Zext(x, to) => (12, *to as u128, vec![self.canon_id(x)]),
+            Node::Sext(x, to) => (13, *to as u128, vec![self.canon_id(x)]),
+            Node::Extract(x, hi, lo) => (
+                14,
+                ((*hi as u128) << 32) | (*lo as u128),
+                vec![self.canon_id(x)],
+            ),
+            Node::Concat(hi, lo) => (15, 0, vec![self.canon_id(hi), self.canon_id(lo)]),
+            Node::Ite(c, t, e) => (
+                16,
+                0,
+                vec![self.canon_id(c), self.canon_id(t), self.canon_id(e)],
+            ),
+        };
+        let key = ShapeKey {
+            tag,
+            width,
+            arg,
+            kids,
+        };
+        let next = self.shapes.len();
+        let id = *self.shapes.entry(key).or_insert(next);
+        self.canon.insert(ptr, id);
+        id
+    }
+
+    /// `a ∧ b`, folded when an operand is the pinned-true/false literal or the
+    /// operands are the same/opposite literal.
+    ///
+    /// The fold is not cosmetic: every adder's carry-in is the constant false
+    /// literal and the ripple chain threads it, so without folding each full
+    /// adder costs five clauses where two suffice. Arithmetic circuits here
+    /// are built almost entirely out of gates with a constant on one side
+    /// (adder carries, `const_bits`, the zero-filled high half of a shift), so
+    /// the whole family shrinks with it.
     fn and(&mut self, a: i32, b: i32) -> i32 {
+        let (t, f) = (self.true_lit, -self.true_lit);
+        if a == t {
+            return b;
+        }
+        if b == t {
+            return a;
+        }
+        if a == f || b == f {
+            return f;
+        }
+        if a == b {
+            return a;
+        }
+        if a == -b {
+            return f;
+        }
         let o = self.cnf.new_var();
         self.cnf.add_clause(&[-o, a]);
         self.cnf.add_clause(&[-o, b]);
@@ -74,6 +238,22 @@ impl<'b> Blaster<'b> {
         o
     }
     fn or(&mut self, a: i32, b: i32) -> i32 {
+        let (t, f) = (self.true_lit, -self.true_lit);
+        if a == t || b == t {
+            return t;
+        }
+        if a == f {
+            return b;
+        }
+        if b == f {
+            return a;
+        }
+        if a == b {
+            return a;
+        }
+        if a == -b {
+            return t;
+        }
         let o = self.cnf.new_var();
         self.cnf.add_clause(&[o, -a]);
         self.cnf.add_clause(&[o, -b]);
@@ -81,6 +261,25 @@ impl<'b> Blaster<'b> {
         o
     }
     fn xor(&mut self, a: i32, b: i32) -> i32 {
+        let (t, f) = (self.true_lit, -self.true_lit);
+        if a == f {
+            return b;
+        }
+        if b == f {
+            return a;
+        }
+        if a == t {
+            return -b;
+        }
+        if b == t {
+            return -a;
+        }
+        if a == b {
+            return f;
+        }
+        if a == -b {
+            return t;
+        }
         let o = self.cnf.new_var();
         self.cnf.add_clause(&[-o, -a, -b]);
         self.cnf.add_clause(&[-o, a, b]);
@@ -137,12 +336,20 @@ impl<'b> Blaster<'b> {
         if let Some(bits) = self.memo.get(&key) {
             return bits.clone();
         }
+        // Pointer-identity sharing first (cheapest), then structural sharing: terms
+        // built separately from the same inputs are one circuit.
+        let shape = self.canon_id(bv);
+        if let Some(bits) = self.struct_memo.get(&shape) {
+            self.memo.insert(key, bits.clone());
+            return bits.clone();
+        }
         let bits = if self.over() || self.cnf.full {
             vec![self.f(); bv.width() as usize]
         } else {
             self.encode_node(bv)
         };
         self.memo.insert(key, bits.clone());
+        self.struct_memo.insert(shape, bits.clone());
         bits
     }
 
@@ -177,7 +384,57 @@ impl<'b> Blaster<'b> {
                 self.add_bits(&ab, &zero, self.t()).0 // ¬a + 1
             }
             Node::Bin(op, a, b) => {
+                // Unsigned division (and remainder) by a power of two is a
+                // re-indexing of the dividend's bits: no divider at all. The
+                // restoring divider would charge O(w^2) clauses for a `>> k`
+                // the program is about to do anyway, and `Bv` already folds a
+                // wholly constant pair, so this fires only when the dividend
+                // is symbolic.
+                if matches!(op, Op::Udiv | Op::Urem)
+                    && let Some(c) = b.as_const()
+                    && c.is_power_of_two()
+                {
+                    let ab = self.encode(a);
+                    let k = c.trailing_zeros() as usize;
+                    let f = self.f();
+                    return (0..w)
+                        .map(|i| match op {
+                            Op::Udiv if i + k < w => ab[i + k],
+                            Op::Udiv => f,
+                            _ if i < k => ab[i],
+                            _ => f,
+                        })
+                        .collect();
+                }
                 let (ab, bb) = (self.encode(a), self.encode(b));
+                // Division trims statically-zero high bits: an engine that
+                // widens a `u64` to `u128` by zero-extension hands over an
+                // operand whose top half is the pinned-false literal, and the
+                // wide restoring divider would spend four times the gates
+                // proving that a < 2^64. With `k` such bits on both operands,
+                // both the quotient and the remainder fit in `w - k` bits, so
+                // the divider runs at that width and the result is
+                // zero-extended. A zero divisor is the one case the narrow
+                // circuit answers differently at the wider width (all-ones
+                // rather than all-ones-narrow zero-extended; the remainder is
+                // the *whole* dividend), so it is muxed back in.
+                if matches!(op, Op::Udiv | Op::Urem) {
+                    let f = self.f();
+                    let k = known_zero_high(&ab, f).min(known_zero_high(&bb, f));
+                    if k > 0 && k < w {
+                        let n = w - k;
+                        let (q, r) = self.udivrem_bits(&ab[..n], &bb[..n]);
+                        let mut wide = if matches!(op, Op::Udiv) { q } else { r };
+                        wide.resize(w, f);
+                        let bzero = self.eq_bits(&bb[..n], &vec![f; n]);
+                        let on_zero = if matches!(op, Op::Udiv) {
+                            vec![self.t(); w]
+                        } else {
+                            ab.clone()
+                        };
+                        return self.mux_vec(bzero, &on_zero, &wide);
+                    }
+                }
                 match op {
                     Op::And => (0..w).map(|i| self.and(ab[i], bb[i])).collect(),
                     Op::Or => (0..w).map(|i| self.or(ab[i], bb[i])).collect(),
@@ -320,6 +577,35 @@ impl<'b> Blaster<'b> {
 
     /// A 2:1 mux on two literals: `c ? t : e`.
     fn mux(&mut self, c: i32, t: i32, e: i32) -> i32 {
+        let (tl, fl) = (self.true_lit, -self.true_lit);
+        if c == tl {
+            return t;
+        }
+        if c == fl {
+            return e;
+        }
+        if t == e {
+            return t;
+        }
+        if t == tl && e == fl {
+            return c;
+        }
+        if t == fl && e == tl {
+            return -c;
+        }
+        // The one-sided constant forms, as their two-gate equivalents.
+        if t == tl {
+            return self.or(c, e); // c ∨ e
+        }
+        if e == fl {
+            return self.and(c, t); // c ∧ t
+        }
+        if t == fl {
+            return self.and(-c, e); // ¬c ∧ e
+        }
+        if e == tl {
+            return self.or(-c, t); // ¬c ∨ t
+        }
         let a = self.and(c, t);
         let b = self.and(-c, e);
         self.or(a, b)
@@ -565,6 +851,18 @@ impl<'b> Blaster<'b> {
     }
 }
 
+/// How many high bits of an encoded operand are the pinned-false literal -
+/// statically known zero, no search involved.
+///
+/// A zero-extension (`concat(0, x)`) and a constant mask both encode their
+/// high zeros to exactly this literal, so this is the cheap static range
+/// information the blaster can act on: `u128` arithmetic whose operands are
+/// widened `u64`s is really 64-bit arithmetic, and here it can be blasted as
+/// such.
+fn known_zero_high(bits: &[i32], f: i32) -> usize {
+    bits.iter().rev().take_while(|&&l| l == f).count()
+}
+
 /// Which way a symbolic shift moves, and therefore what it fills vacated bits with.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ShKind {
@@ -653,7 +951,11 @@ mod tests {
                 "shl_var64" => 2_000,
                 "rot_var64" => 1_500,
                 "sgt64" => 500,
-                "rot_var5 (modulo-divider path)" => 400,
+                // The gate-level constant folding shrank the halves of every
+                // adder, so this path measured 334 after it (was ~430). The
+                // floor only has to separate "real circuit" from "folded to
+                // nothing", not pin the encoding.
+                "rot_var5 (modulo-divider path)" => 200,
                 _ => unreachable!(),
             };
             assert!(
@@ -661,6 +963,57 @@ mod tests {
                 "{name} blasted only {n} clauses (floor {floor}) - did the operands fold?"
             );
         }
+    }
+
+    /// A symbolic dividend over a *literal* power-of-two divisor is a bit
+    /// re-indexing, not a divider: `x / 2^k` is `x >> k` and `x % 2^k` keeps the
+    /// low `k` bits, both built from the dividend's own literals. The two
+    /// operands are asserted to be the same nodes, so this pins the encoding
+    /// and not just the clause count.
+    #[test]
+    fn a_literal_power_of_two_divisor_blasts_no_divider() {
+        let x = var(64, 0);
+        assert_eq!(circuit_size(&x.udiv(&Bv::val(1024, 64))), 0);
+        assert_eq!(circuit_size(&x.urem(&Bv::val(1024, 64))), 0);
+        // A non-power-of-two literal still builds a divider, so the arm is
+        // specific rather than "any constant divisor" - but the gate-level
+        // constant folding makes it a much cheaper one: 34k clauses at 64 bits
+        // against 106k for two symbolic operands, and the same 34k at 128 bits
+        // when the dividend's top half is a zero-extension.
+        let general = circuit_size(&x.udiv(&Bv::val(1000, 64)));
+        assert!(
+            general > 10_000,
+            "a literal non-power-of-two still builds a divider"
+        );
+        assert!(
+            general < 50_000,
+            "constant folding shrank the constant-divisor divider"
+        );
+    }
+
+    /// The static-range trim: a `u128` division whose operands are widened
+    /// `u64`s has a statically-zero top half, so the divider runs at 64 bits and
+    /// the result is zero-extended. Before the trim this cost 327k clauses at
+    /// 128 bits; the narrow circuit is 106k, and the trim adds only the
+    /// zero-divisor mux on top.
+    #[test]
+    fn a_zero_extended_division_runs_at_the_narrow_width() {
+        let z = Bv::val(0, 64);
+        let (x, y) = (var(64, 0), var(64, 1));
+        let narrow = circuit_size(&x.udiv(&y));
+        let wide = circuit_size(&z.concat(&x).udiv(&z.concat(&y)));
+        assert!(
+            wide < narrow * 2,
+            "zero-extended 128-bit divide blasted {wide} clauses against {narrow} at 64 bits"
+        );
+        // The literal divisor case does not even pay for the wide divider: the
+        // narrow circuit plus the zero-divisor mux, nothing more.
+        let literal = circuit_size(&x.udiv(&Bv::val(1000, 64)));
+        let wide_literal = circuit_size(&z.concat(&x).udiv(&Bv::val(1000, 128)));
+        assert!(
+            wide_literal < literal + 1_000,
+            "zero-extended literal divide blasted {wide_literal} against {literal} at 64 bits"
+        );
     }
 
     #[test]

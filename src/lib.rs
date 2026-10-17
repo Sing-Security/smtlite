@@ -39,9 +39,10 @@
 //!
 //! # Width and threading limits
 //!
-//! Widths are 1..=64 bits, because [`Model::get`] reads a variable back as a `u64`. An
-//! operation whose result or target width would fall outside 1..=64 **panics**, as does one
-//! given two operands of different widths; each such method says so under `# Panics`.
+//! Widths are 1..=128 bits. [`Model::get`] reads a variable back as a `u64`, so a value wider
+//! than 64 bits reads back through [`Model::get128`] instead. An operation whose result or
+//! target width would fall outside 1..=128 **panics**, as does one given two operands of
+//! different widths; each such method says so under `# Panics`.
 //!
 //! A [`Bv`] is an `Rc`-shared node, so neither [`Bv`] nor [`Solver`] is `Send` or `Sync` - one
 //! solve runs on one thread.
@@ -49,19 +50,28 @@
 
 mod blast;
 mod bv;
+pub mod field;
 mod sat;
+pub mod set;
+pub mod theory;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 pub use bv::{Bv, mask};
+pub use set::Set;
+pub use theory::{Array, ArrayTheory, ModelView, Theory, Uninterpreted};
 
 use blast::Blaster;
 use bv::Node;
 use sat::SatResult::{Sat, Unknown, Unsat};
 
 /// Default decision budget before a query degrades to [`Solution::Unknown`].
-const DEFAULT_BUDGET: u64 = 4_000_000;
+///
+/// Public so a consumer that calls the `_theories` entry points - whose budget
+/// is explicit, unlike [`Solver::check`]'s - can pass the same bound the
+/// plain entry points use instead of hard-coding a number that drifts.
+pub const DEFAULT_BUDGET: u64 = 4_000_000;
 
 /// Default formula-size cap: the blaster stops generating clauses at this count, and a formula
 /// that would exceed it is [`Solution::Unknown`] without being solved at all.
@@ -94,13 +104,40 @@ pub enum Solution {
 }
 
 /// The SMT context: named bitvector variables and asserted constraints.
-#[derive(Debug)]
 pub struct Solver {
     vars: Vec<(String, u32)>,
     asserts: Vec<Bv>,
     max_clauses: usize,
     cache: RefCell<Option<CacheState>>,
+    /// The registered theories, consulted by the `check_*_theories` entry points only.
+    theories: Vec<Box<dyn Theory>>,
+    /// Model-check rounds allowed per theory query before `Unknown` - see
+    /// [`Solver::with_theory_rounds`].
+    theory_rounds: usize,
 }
+
+impl std::fmt::Debug for Solver {
+    /// Hand-written because a registered [`Theory`] is a trait object: the summary reports the
+    /// registered names (in registration order), not the boxed internals.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Solver")
+            .field("vars", &self.vars)
+            .field("asserts", &self.asserts.len())
+            .field("max_clauses", &self.max_clauses)
+            .field("cached", &self.cache.borrow().is_some())
+            .field(
+                "theories",
+                &self.theories.iter().map(|t| t.name()).collect::<Vec<_>>(),
+            )
+            .field("theory_rounds", &self.theory_rounds)
+            .finish()
+    }
+}
+
+/// Default model-check rounds for a theory query: enough for the theories that converge over a
+/// few refinements, bounded so a query that would need unboundedly many answers `Unknown`
+/// instead of looping.
+const DEFAULT_THEORY_ROUNDS: usize = 8;
 
 /// The blasted background of the stored constraints, kept so the per-path entry points can reuse
 /// it instead of re-blasting the shared part for every query. Owned clause vectors, so it outlives
@@ -133,6 +170,8 @@ impl Default for Solver {
             asserts: Vec::new(),
             max_clauses: DEFAULT_MAX_CLAUSES,
             cache: RefCell::new(None),
+            theories: Vec::new(),
+            theory_rounds: DEFAULT_THEORY_ROUNDS,
         }
     }
 }
@@ -170,13 +209,12 @@ impl Solver {
     ///
     /// # Panics
     ///
-    /// Panics unless `width` is 1..=64. A model is read back through a `u64`, so every width
-    /// in the crate is bounded by that; a wider variable would be unreadable and could not
-    /// hold a constant.
+    /// Panics unless `width` is 1..=128 - the term ceiling. A variable wider than 64 bits is
+    /// still readable, through [`Model::get128`].
     pub fn var(&mut self, name: &str, width: u32) -> Bv {
         assert!(
-            (1..=64).contains(&width),
-            "variable width must be 1..=64, got {width}"
+            (1..=128).contains(&width),
+            "variable width must be 1..=128, got {width}"
         );
         let id = self.vars.len();
         self.vars.push((name.to_string(), width));
@@ -549,22 +587,41 @@ impl Model {
     /// assert_eq!(m.get("never_declared"), None);
     /// ```
     ///
-    /// A model reads back as a `u64`, so a value wider than that has no representation and
-    /// reads back as `None`. Widths are capped at 64 throughout ([`Solver::var`]), so this is
-    /// unreachable through the public API; it is checked rather than assumed so the readback
-    /// can never shift a bit off the end of the word.
+    /// A model reads back as a `u64`, so a value wider than that has no representation here
+    /// and reads back as `None`; use [`get128`](Model::get128) for the full value. It is
+    /// checked rather than assumed so the readback can never shift a bit off the end of a
+    /// word.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<u64> {
-        let id = *self.name_to_id.get(name)?;
+        self.value_of(*self.name_to_id.get(name)?)
+    }
+
+    /// The value a variable took at the crate's full 128-bit width.
+    #[must_use]
+    pub fn get128(&self, name: &str) -> Option<u128> {
+        self.value_of128(*self.name_to_id.get(name)?)
+    }
+
+    /// The value a variable *id* took - [`get`](Model::get) without the name lookup, for a
+    /// caller walking terms rather than reading labels (the theory layer's evaluator). `None`
+    /// means the id is not in this model, or the variable is wider than a `u64`.
+    pub(crate) fn value_of(&self, id: usize) -> Option<u64> {
         let bits = self.var_bits.get(&id)?;
         if bits.len() > 64 {
             return None;
         }
-        let mut v = 0u64;
+        self.value_of128(id).and_then(|v| u64::try_from(v).ok())
+    }
+
+    /// The value a variable id took at 128 bits - the readback the theory layer's evaluator
+    /// uses so a wide term can still be checked against a model.
+    pub(crate) fn value_of128(&self, id: usize) -> Option<u128> {
+        let bits = self.var_bits.get(&id)?;
+        let mut v = 0u128;
         for (i, &lit) in bits.iter().enumerate() {
             let base = self.assignment[(lit.unsigned_abs() - 1) as usize];
             if if lit > 0 { base } else { !base } {
-                v |= 1u64 << i;
+                v |= 1u128 << i;
             }
         }
         Some(v)

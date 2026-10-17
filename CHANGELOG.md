@@ -5,6 +5,46 @@ All notable changes to smtlite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-10-17
+
+### Added
+
+- **A theory layer over the QF_BV core, with the soundness law stated and enforced.**
+  A `Theory` is a source of lemmas, not a second decision procedure: its axioms are
+  instantiated against a model and the query is re-solved. The law is *SAT is a claim
+  until validated; UNSAT is a fact* - lemma instantiation is monotone, so an `Unsat`
+  under any subset needs nothing more, while a `Sat` is returned only after every
+  registered theory's `violated_lemmas` accepts the model. The round budget running
+  out is `Unknown`, never a guess. No new SAT, no C, no `unsafe`, no new dependency.
+  Entry points: `Solver::check_theories` / `check_assumptions_theories`,
+  `Solver::with_theory_rounds`, `Solver::model_consistent`; `DEFAULT_BUDGET` is now
+  public so a caller can pass the same bound the plain entry points use.
+- **The theory of arrays** (`Array`, `ArrayTheory`): `select`/`store` lowered to
+  bitvectors with read-over-write, plus congruence for the base array.
+- **Uninterpreted functions** (`Uninterpreted`): congruence only - equal arguments
+  imply equal results - which is exactly what a symbolic executor needs from a call
+  it does not model (a syscall status, a CPI return, a hash).
+- **Finite sets** (`Set<N>`): an `N`-element set lowered to one characteristic
+  bitvector, with symbolic element indices. Fully eager - no lemma to validate.
+- **Prime-field arithmetic** (`field::Fp`, `BABY_BEAR`): canonical elements of
+  `p = 2^31 - 2^27 + 1` encoded as 32-bit bit-vectors.
+- **128-bit terms.** Widths now run `1..=128`; `Bv::val128`/`as_const128`,
+  `Model::get128` and `ModelView::eval128` carry the full value, while `Model::get`
+  keeps its `u64` contract (and returns `None` above 64 bits).
+
+### Changed
+
+- **Structurally identical terms share one encoding, even across separate handles.**
+  The blaster now canonicalises a term shape by operator and operand id before
+  emitting clauses, so a caller's `x == y` and a theory lemma's `y == x` - distinct
+  `Rc`s with equal structure - share one SAT encoding instead of doubling the
+  circuit. A lemma that restates a stored constraint is therefore cheap. On a
+  128-bit array query this took the decision from roughly 9 s / `Unknown` to a
+  sub-millisecond `Unsat`; the property is tested directly.
+- **Static-range trimming for widened division.** A `u128` division whose operands
+  are widened `u64`s is blasted as 64-bit arithmetic, and a literal power-of-two
+  divisor blasts no divider at all.
+
 ## [0.1.10] - 2026-10-09
 
 ### Changed

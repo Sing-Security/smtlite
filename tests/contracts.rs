@@ -8,29 +8,29 @@
 use smtlite::{Bv, Solver};
 
 #[test]
-#[should_panic(expected = "variable width must be 1..=64")]
+#[should_panic(expected = "variable width must be 1..=128")]
 fn var_width_zero_panics() {
     let mut s = Solver::new();
     let _ = s.var("x", 0);
 }
 
 #[test]
-#[should_panic(expected = "variable width must be 1..=64")]
-fn var_width_65_panics() {
+#[should_panic(expected = "variable width must be 1..=128")]
+fn var_width_129_panics() {
     let mut s = Solver::new();
-    let _ = s.var("x", 65);
+    let _ = s.var("x", 129);
 }
 
 #[test]
-#[should_panic(expected = "constant width must be 1..=64")]
+#[should_panic(expected = "constant width must be 1..=128")]
 fn const_width_zero_panics() {
     let _ = Bv::val(0, 0);
 }
 
 #[test]
-#[should_panic(expected = "constant width must be 1..=64")]
-fn const_width_65_panics() {
-    let _ = Bv::val(0, 65);
+#[should_panic(expected = "constant width must be 1..=128")]
+fn const_width_129_panics() {
+    let _ = Bv::val(0, 129);
 }
 
 #[test]
@@ -90,11 +90,11 @@ fn zext_narrowing_panics() {
 }
 
 #[test]
-#[should_panic(expected = "width must be 1..=64")]
-fn zext_past_64_panics() {
+#[should_panic(expected = "width must be 1..=128")]
+fn zext_past_128_panics() {
     let mut s = Solver::new();
     let x = s.var("x", 8);
-    let _ = x.zext(65);
+    let _ = x.zext(129);
 }
 
 #[test]
@@ -106,11 +106,11 @@ fn sext_narrowing_panics() {
 }
 
 #[test]
-#[should_panic(expected = "width must be 1..=64")]
-fn sext_past_64_panics() {
+#[should_panic(expected = "width must be 1..=128")]
+fn sext_past_128_panics() {
     let mut s = Solver::new();
     let x = s.var("x", 8);
-    let _ = x.sext(65);
+    let _ = x.sext(129);
 }
 
 #[test]
@@ -130,10 +130,10 @@ fn extract_hi_at_width_panics() {
 }
 
 #[test]
-#[should_panic(expected = "over the 64-bit limit")]
-fn concat_over_64_panics() {
+#[should_panic(expected = "over the 128-bit limit")]
+fn concat_over_128_panics() {
     let mut s = Solver::new();
-    let x = s.var("x", 40);
+    let x = s.var("x", 80);
     let _ = x.concat(&x);
 }
 
@@ -145,7 +145,7 @@ fn land_on_multi_bit_panics() {
     let _ = x.land(&x);
 }
 
-/// The boundary *just inside* the limit must not panic: width 1 and width 64 are both valid.
+/// The boundary *just inside* the limit must not panic: widths 1, 64 and 128 are all valid.
 #[test]
 fn boundary_widths_are_valid() {
     let mut s = Solver::new();
@@ -157,4 +157,9 @@ fn boundary_widths_are_valid() {
     // A 64-bit value can be read back, so it can hold and constrain all ones.
     s.assert(full.eq(&Bv::val(u64::MAX, 64)));
     assert!(matches!(s.check(), smtlite::Solution::Sat(m) if m.get("full") == Some(u64::MAX)));
+
+    // The wide boundary reads back through `get128`, including all ones.
+    let wide = s.var("wide", 128);
+    s.assert(wide.eq(&Bv::val128(u128::MAX, 128)));
+    assert!(matches!(s.check(), smtlite::Solution::Sat(m) if m.get128("wide") == Some(u128::MAX)));
 }

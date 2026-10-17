@@ -37,7 +37,7 @@ pub(crate) enum Cmp {
 }
 
 pub(crate) enum Node {
-    Const(u32, u64),
+    Const(u32, u128),
     Var(u32, usize),
     Not(Bv),
     Neg(Bv),
@@ -77,6 +77,13 @@ impl Bv {
         Rc::ptr_eq(&self.0, &other.0)
     }
 
+    /// The shared node's address, as a `HashMap` key. Identity, like [`ptr_eq`](Bv::ptr_eq),
+    /// but in the form a dedup table needs.
+    #[must_use]
+    pub(crate) fn ptr_key(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize
+    }
+
     /// The width of this value in bits.
     #[must_use]
     pub fn width(&self) -> u32 {
@@ -109,23 +116,41 @@ impl Bv {
     ///
     /// # Panics
     ///
-    /// Panics unless `w` is 1..=64 - see [`Solver::var`](crate::Solver::var).
+    /// Panics unless `w` is 1..=128 - see [`Solver::var`](crate::Solver::var).
     #[must_use]
     pub fn val(v: u64, w: u32) -> Bv {
-        assert!(
-            (1..=64).contains(&w),
-            "constant width must be 1..=64, got {w}"
-        );
-        Bv::wrap(Node::Const(w, mask(v, w)))
+        Bv::val128(u128::from(v), w)
     }
 
-    /// The value as a plain number, if this handle *is* a constant.
+    /// A width-`w` constant holding the full 128-bit value `v`. Bits at or above `w` are
+    /// discarded.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `w` is 1..=128 - see [`Solver::var`](crate::Solver::var).
+    #[must_use]
+    pub fn val128(v: u128, w: u32) -> Bv {
+        assert!(
+            (1..=128).contains(&w),
+            "constant width must be 1..=128, got {w}"
+        );
+        Bv::wrap(Node::Const(w, mask128(v, w)))
+    }
+
+    /// The value as a plain number, if this handle *is* a constant that fits a `u64`.
     ///
     /// Constant expressions fold on construction, so this answers more often than "is this
     /// handle a `val`": `Bv::val(1, 8).add(&Bv::val(1, 8))` is already the constant `2`. An
-    /// expression that mentions a variable still returns `None` here.
+    /// expression that mentions a variable, or a constant wider than 64 bits, still returns
+    /// `None` here - use [`as_const128`](Bv::as_const128) for the full value.
     #[must_use]
     pub fn as_const(&self) -> Option<u64> {
+        self.as_const128().and_then(|v| u64::try_from(v).ok())
+    }
+
+    /// The value as a 128-bit number, if this handle *is* a constant.
+    #[must_use]
+    pub fn as_const128(&self) -> Option<u128> {
         if let Node::Const(_, v) = &*self.0 {
             Some(*v)
         } else {
@@ -487,8 +512,9 @@ impl Bv {
     ///
     /// # Panics
     ///
-    /// Panics unless `new_w` is between this value's width and 64. Narrowing is
-    /// [`extract`](Bv::extract)'s job, and 64 is the ceiling a model can read back.
+    /// Panics unless `new_w` is between this value's width and 128. Narrowing is
+    /// [`extract`](Bv::extract)'s job; 128 is the term ceiling, and a value wider than 64
+    /// needs [`Model::get128`](crate::Model::get128) to read back.
     #[must_use]
     pub fn zext(&self, new_w: u32) -> Bv {
         assert!(
@@ -496,7 +522,7 @@ impl Bv {
             "zext must widen: {} to {new_w}",
             self.width()
         );
-        assert!(new_w <= 64, "width must be 1..=64, got {new_w}");
+        assert!(new_w <= 128, "width must be 1..=128, got {new_w}");
         Bv::wrap(Node::Zext(self.clone(), new_w))
     }
 
@@ -505,7 +531,7 @@ impl Bv {
     ///
     /// # Panics
     ///
-    /// Panics unless `new_w` is between this value's width and 64.
+    /// Panics unless `new_w` is between this value's width and 128.
     #[must_use]
     pub fn sext(&self, new_w: u32) -> Bv {
         assert!(
@@ -513,7 +539,7 @@ impl Bv {
             "sext must widen: {} to {new_w}",
             self.width()
         );
-        assert!(new_w <= 64, "width must be 1..=64, got {new_w}");
+        assert!(new_w <= 128, "width must be 1..=128, got {new_w}");
         Bv::wrap(Node::Sext(self.clone(), new_w))
     }
 
@@ -523,7 +549,7 @@ impl Bv {
     /// # Panics
     ///
     /// Panics unless `lo <= hi` and `hi` is a bit this value actually has
-    /// (`hi < width`). The result width is therefore always within 1..=64.
+    /// (`hi < width`). The result width is therefore always within 1..=128.
     #[must_use]
     pub fn extract(&self, hi: u32, lo: u32) -> Bv {
         assert!(
@@ -538,13 +564,13 @@ impl Bv {
     ///
     /// # Panics
     ///
-    /// Panics if the combined width exceeds 64.
+    /// Panics if the combined width exceeds 128.
     #[must_use]
     pub fn concat(&self, low: &Bv) -> Bv {
         let w = self.width() + low.width();
         assert!(
-            w <= 64,
-            "concatenation is {w} bits wide, over the 64-bit limit"
+            w <= 128,
+            "concatenation is {w} bits wide, over the 128-bit limit"
         );
         Bv::wrap(Node::Concat(self.clone(), low.clone()))
     }
@@ -597,6 +623,29 @@ impl Bv {
         );
         self.and(o)
     }
+
+    /// `self => o`, as a 1-bit value: `!self | o`. The theory layer's lemma shape - an axiom
+    /// instance is "if these terms are what the model says they are, then this must hold".
+    ///
+    /// # Panics
+    ///
+    /// Panics if either operand is wider than 1 bit.
+    #[must_use]
+    pub fn implies(&self, o: &Bv) -> Bv {
+        assert_eq!(
+            self.width(),
+            1,
+            "implies antecedent must be 1 bit, got {}",
+            self.width()
+        );
+        assert_eq!(
+            o.width(),
+            1,
+            "implies consequent must be 1 bit, got {}",
+            o.width()
+        );
+        self.not().or(o)
+    }
 }
 
 /// Truncate `v` to its low `w` bits. `w` at or above 64 leaves `v` unchanged, since there are
@@ -604,6 +653,12 @@ impl Bv {
 #[must_use]
 pub fn mask(v: u64, w: u32) -> u64 {
     if w >= 64 { v } else { v & ((1u64 << w) - 1) }
+}
+
+/// [`mask`] at the crate's full 128-bit width.
+#[must_use]
+pub(crate) fn mask128(v: u128, w: u32) -> u128 {
+    if w >= 128 { v } else { v & ((1u128 << w) - 1) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -619,8 +674,8 @@ fn fold(n: &Node) -> Option<Bv> {
     match n {
         Node::Const(_, _) | Node::Var(_, _) => None,
         Node::Not(a) => {
-            if let Some(v) = a.as_const() {
-                return Some(const_of(a.width(), mask(!v, a.width())));
+            if let Some(v) = a.as_const128() {
+                return Some(const_of(a.width(), mask128(!v, a.width())));
             }
             if let Node::Not(b) = &*a.0 {
                 return Some(b.clone());
@@ -628,8 +683,11 @@ fn fold(n: &Node) -> Option<Bv> {
             None
         }
         Node::Neg(a) => {
-            if let Some(v) = a.as_const() {
-                return Some(const_of(a.width(), mask(0u64.wrapping_sub(v), a.width())));
+            if let Some(v) = a.as_const128() {
+                return Some(const_of(
+                    a.width(),
+                    mask128(0u128.wrapping_sub(v), a.width()),
+                ));
             }
             if let Node::Neg(b) = &*a.0 {
                 return Some(b.clone());
@@ -638,8 +696,8 @@ fn fold(n: &Node) -> Option<Bv> {
         }
         Node::Bin(op, a, b) => fold_bin(*op, a, b),
         Node::ShlC(a, k) => {
-            if let Some(v) = a.as_const() {
-                return Some(const_of(a.width(), shl_(v, u64::from(*k), a.width())));
+            if let Some(v) = a.as_const128() {
+                return Some(const_of(a.width(), shl_(v, u128::from(*k), a.width())));
             }
             if *k == 0 {
                 return Some(a.clone());
@@ -647,9 +705,9 @@ fn fold(n: &Node) -> Option<Bv> {
             None
         }
         Node::ShrC(a, k, arith) => {
-            if let Some(v) = a.as_const() {
+            if let Some(v) = a.as_const128() {
                 let w = a.width();
-                return Some(const_of(w, shr_(v, u64::from(*k), w, *arith)));
+                return Some(const_of(w, shr_(v, u128::from(*k), w, *arith)));
             }
             if *k == 0 {
                 return Some(a.clone());
@@ -657,8 +715,8 @@ fn fold(n: &Node) -> Option<Bv> {
             None
         }
         Node::ShlV(a, k) => {
-            if let Some(kv) = k.as_const() {
-                if let Some(v) = a.as_const() {
+            if let Some(kv) = k.as_const128() {
+                if let Some(v) = a.as_const128() {
                     return Some(const_of(a.width(), shl_(v, kv, a.width())));
                 }
                 if kv == 0 {
@@ -668,8 +726,8 @@ fn fold(n: &Node) -> Option<Bv> {
             None
         }
         Node::ShrV(a, k, arith) => {
-            if let Some(kv) = k.as_const() {
-                if let Some(v) = a.as_const() {
+            if let Some(kv) = k.as_const128() {
+                if let Some(v) = a.as_const128() {
                     let w = a.width();
                     return Some(const_of(w, shr_(v, kv, w, *arith)));
                 }
@@ -680,9 +738,9 @@ fn fold(n: &Node) -> Option<Bv> {
             None
         }
         Node::RotC(a, k, left) => {
-            if let Some(v) = a.as_const() {
+            if let Some(v) = a.as_const128() {
                 let w = a.width();
-                return Some(const_of(w, rot_(v, u64::from(*k), w, *left)));
+                return Some(const_of(w, rot_(v, u128::from(*k), w, *left)));
             }
             if *k == 0 {
                 return Some(a.clone());
@@ -690,8 +748,8 @@ fn fold(n: &Node) -> Option<Bv> {
             None
         }
         Node::RotV(a, k, left) => {
-            if let Some(kv) = k.as_const() {
-                if let Some(v) = a.as_const() {
+            if let Some(kv) = k.as_const128() {
+                if let Some(v) = a.as_const128() {
                     let w = a.width();
                     return Some(const_of(w, rot_(v, kv, w, *left)));
                 }
@@ -703,7 +761,7 @@ fn fold(n: &Node) -> Option<Bv> {
         }
         Node::Compare(c, a, b) => fold_cmp(*c, a, b),
         Node::Zext(a, w) => {
-            if let Some(v) = a.as_const() {
+            if let Some(v) = a.as_const128() {
                 return Some(const_of(*w, v));
             }
             if *w == a.width() {
@@ -712,8 +770,8 @@ fn fold(n: &Node) -> Option<Bv> {
             None
         }
         Node::Sext(a, w) => {
-            if let Some(v) = a.as_const() {
-                return Some(const_of(*w, mask(signed(v, a.width()) as u64, *w)));
+            if let Some(v) = a.as_const128() {
+                return Some(const_of(*w, mask128(signed(v, a.width()) as u128, *w)));
             }
             if *w == a.width() {
                 return Some(a.clone());
@@ -721,8 +779,8 @@ fn fold(n: &Node) -> Option<Bv> {
             None
         }
         Node::Extract(a, hi, lo) => {
-            if let Some(v) = a.as_const() {
-                return Some(const_of(*hi - *lo + 1, mask(v >> *lo, *hi - *lo + 1)));
+            if let Some(v) = a.as_const128() {
+                return Some(const_of(*hi - *lo + 1, mask128(v >> *lo, *hi - *lo + 1)));
             }
             if *lo == 0 && *hi == a.width() - 1 {
                 return Some(a.clone());
@@ -730,9 +788,9 @@ fn fold(n: &Node) -> Option<Bv> {
             None
         }
         Node::Concat(a, b) => {
-            if let (Some(x), Some(y)) = (a.as_const(), b.as_const()) {
+            if let (Some(x), Some(y)) = (a.as_const128(), b.as_const128()) {
                 let w = a.width() + b.width();
-                return Some(const_of(w, mask((x << b.width()) | y, w)));
+                return Some(const_of(w, mask128((x << b.width()) | y, w)));
             }
             None
         }
@@ -740,7 +798,7 @@ fn fold(n: &Node) -> Option<Bv> {
             if a.ptr_eq(b) {
                 return Some(a.clone());
             }
-            if let Some(cv) = c.as_const() {
+            if let Some(cv) = c.as_const128() {
                 return Some(if cv != 0 { a.clone() } else { b.clone() });
             }
             None
@@ -751,16 +809,16 @@ fn fold(n: &Node) -> Option<Bv> {
 /// Fold a binary op: both operands constant, one operand an identity, or an operand repeated.
 fn fold_bin(op: Op, a: &Bv, b: &Bv) -> Option<Bv> {
     let w = a.width();
-    if let (Some(x), Some(y)) = (a.as_const(), b.as_const()) {
+    if let (Some(x), Some(y)) = (a.as_const128(), b.as_const128()) {
         return Some(const_of(w, eval_bin(op, x, y, w)));
     }
-    let all = mask(u64::MAX, w);
+    let all = mask128(u128::MAX, w);
     match op {
         Op::Add => {
-            if a.as_const() == Some(0) {
+            if a.as_const128() == Some(0) {
                 return Some(b.clone());
             }
-            if b.as_const() == Some(0) {
+            if b.as_const128() == Some(0) {
                 return Some(a.clone());
             }
         }
@@ -768,18 +826,18 @@ fn fold_bin(op: Op, a: &Bv, b: &Bv) -> Option<Bv> {
             if a.ptr_eq(b) {
                 return Some(const_of(w, 0));
             }
-            if b.as_const() == Some(0) {
+            if b.as_const128() == Some(0) {
                 return Some(a.clone());
             }
         }
         Op::Mul => {
-            if a.as_const() == Some(0) || b.as_const() == Some(0) {
+            if a.as_const128() == Some(0) || b.as_const128() == Some(0) {
                 return Some(const_of(w, 0));
             }
-            if a.as_const() == Some(1) {
+            if a.as_const128() == Some(1) {
                 return Some(b.clone());
             }
-            if b.as_const() == Some(1) {
+            if b.as_const128() == Some(1) {
                 return Some(a.clone());
             }
         }
@@ -787,13 +845,13 @@ fn fold_bin(op: Op, a: &Bv, b: &Bv) -> Option<Bv> {
             if a.ptr_eq(b) {
                 return Some(a.clone());
             }
-            if a.as_const() == Some(0) || b.as_const() == Some(0) {
+            if a.as_const128() == Some(0) || b.as_const128() == Some(0) {
                 return Some(const_of(w, 0));
             }
-            if a.as_const() == Some(all) {
+            if a.as_const128() == Some(all) {
                 return Some(b.clone());
             }
-            if b.as_const() == Some(all) {
+            if b.as_const128() == Some(all) {
                 return Some(a.clone());
             }
         }
@@ -801,13 +859,13 @@ fn fold_bin(op: Op, a: &Bv, b: &Bv) -> Option<Bv> {
             if a.ptr_eq(b) {
                 return Some(a.clone());
             }
-            if a.as_const() == Some(0) {
+            if a.as_const128() == Some(0) {
                 return Some(b.clone());
             }
-            if b.as_const() == Some(0) {
+            if b.as_const128() == Some(0) {
                 return Some(a.clone());
             }
-            if a.as_const() == Some(all) || b.as_const() == Some(all) {
+            if a.as_const128() == Some(all) || b.as_const128() == Some(all) {
                 return Some(const_of(w, all));
             }
         }
@@ -815,24 +873,24 @@ fn fold_bin(op: Op, a: &Bv, b: &Bv) -> Option<Bv> {
             if a.ptr_eq(b) {
                 return Some(const_of(w, 0));
             }
-            if a.as_const() == Some(0) {
+            if a.as_const128() == Some(0) {
                 return Some(b.clone());
             }
-            if b.as_const() == Some(0) {
+            if b.as_const128() == Some(0) {
                 return Some(a.clone());
             }
-            if a.as_const() == Some(all) {
+            if a.as_const128() == Some(all) {
                 return Some(b.not());
             }
-            if b.as_const() == Some(all) {
+            if b.as_const128() == Some(all) {
                 return Some(a.not());
             }
         }
         Op::Udiv => {
-            if b.as_const() == Some(1) {
+            if b.as_const128() == Some(1) {
                 return Some(a.clone());
             }
-            if b.as_const() == Some(0) {
+            if b.as_const128() == Some(0) {
                 return Some(const_of(w, all));
             }
         }
@@ -840,15 +898,15 @@ fn fold_bin(op: Op, a: &Bv, b: &Bv) -> Option<Bv> {
             if a.ptr_eq(b) {
                 return Some(const_of(w, 0));
             }
-            if b.as_const() == Some(1) {
+            if b.as_const128() == Some(1) {
                 return Some(const_of(w, 0));
             }
-            if b.as_const() == Some(0) {
+            if b.as_const128() == Some(0) {
                 return Some(a.clone());
             }
         }
         Op::Sdiv => {
-            if b.as_const() == Some(1) {
+            if b.as_const128() == Some(1) {
                 return Some(a.clone());
             }
         }
@@ -856,10 +914,10 @@ fn fold_bin(op: Op, a: &Bv, b: &Bv) -> Option<Bv> {
             if a.ptr_eq(b) {
                 return Some(const_of(w, 0));
             }
-            if b.as_const() == Some(1) {
+            if b.as_const128() == Some(1) {
                 return Some(const_of(w, 0));
             }
-            if b.as_const() == Some(0) {
+            if b.as_const128() == Some(0) {
                 return Some(a.clone());
             }
         }
@@ -870,7 +928,7 @@ fn fold_bin(op: Op, a: &Bv, b: &Bv) -> Option<Bv> {
 /// Fold a comparison: both operands constant, a value compared with itself, or a symmetric
 /// operation compared against its commuted twin (`a + b == b + a`).
 fn fold_cmp(c: Cmp, a: &Bv, b: &Bv) -> Option<Bv> {
-    if let (Some(x), Some(y)) = (a.as_const(), b.as_const()) {
+    if let (Some(x), Some(y)) = (a.as_const128(), b.as_const128()) {
         let w = a.width();
         let bit = match c {
             Cmp::Eq => x == y,
@@ -880,7 +938,7 @@ fn fold_cmp(c: Cmp, a: &Bv, b: &Bv) -> Option<Bv> {
             Cmp::Slt => signed(x, w) < signed(y, w),
             Cmp::Sle => signed(x, w) <= signed(y, w),
         };
-        return Some(const_of(1, u64::from(bit)));
+        return Some(const_of(1, u128::from(bit)));
     }
     if a.ptr_eq(b) {
         return Some(const_of(
@@ -897,7 +955,7 @@ fn fold_cmp(c: Cmp, a: &Bv, b: &Bv) -> Option<Bv> {
                 && is_commutative(*op1)
                 && ((p.ptr_eq(r) && q.ptr_eq(s)) || (p.ptr_eq(s) && q.ptr_eq(r)))
             {
-                return Some(const_of(1, u64::from(c == Cmp::Eq)));
+                return Some(const_of(1, u128::from(c == Cmp::Eq)));
             }
         }
     }
@@ -909,18 +967,18 @@ fn is_commutative(op: Op) -> bool {
 }
 
 /// A fresh constant node, value masked to `w`. Bypasses `wrap` so folding cannot recurse.
-fn const_of(w: u32, v: u64) -> Bv {
-    Bv(Rc::new(Node::Const(w, mask(v, w))))
+fn const_of(w: u32, v: u128) -> Bv {
+    Bv(Rc::new(Node::Const(w, mask128(v, w))))
 }
 
-fn eval_bin(op: Op, x: u64, y: u64, w: u32) -> u64 {
+pub(crate) fn eval_bin(op: Op, x: u128, y: u128, w: u32) -> u128 {
     match op {
-        Op::And => mask(x & y, w),
-        Op::Or => mask(x | y, w),
-        Op::Xor => mask(x ^ y, w),
-        Op::Add => mask(x.wrapping_add(y), w),
-        Op::Sub => mask(x.wrapping_sub(y), w),
-        Op::Mul => mask(x.wrapping_mul(y), w),
+        Op::And => mask128(x & y, w),
+        Op::Or => mask128(x | y, w),
+        Op::Xor => mask128(x ^ y, w),
+        Op::Add => mask128(x.wrapping_add(y), w),
+        Op::Sub => mask128(x.wrapping_sub(y), w),
+        Op::Mul => mask128(x.wrapping_mul(y), w),
         Op::Udiv => udiv_(x, y, w),
         Op::Urem => urem_(x, y, w),
         Op::Sdiv => sdiv_(x, y, w),
@@ -929,45 +987,50 @@ fn eval_bin(op: Op, x: u64, y: u64, w: u32) -> u64 {
 }
 
 /// The `w`-bit two's-complement value of `x`, as a signed integer.
-fn signed(x: u64, w: u32) -> i128 {
-    let x = mask(x, w);
-    if (x >> (w - 1)) & 1 == 1 {
+///
+/// `i128` holds every 128-bit two's-complement value exactly, so the full width is signed
+/// arithmetic with no clamping - at `w == 128` the result is just `x as i128`.
+pub(crate) fn signed(x: u128, w: u32) -> i128 {
+    let x = mask128(x, w);
+    if w == 128 {
+        x as i128
+    } else if (x >> (w - 1)) & 1 == 1 {
         x as i128 - (1i128 << w)
     } else {
         x as i128
     }
 }
 
-fn shl_(x: u64, k: u64, w: u32) -> u64 {
-    if k >= u64::from(w) {
+pub(crate) fn shl_(x: u128, k: u128, w: u32) -> u128 {
+    if k >= u128::from(w) {
         0
     } else {
-        mask(x << k, w)
+        mask128(x << k, w)
     }
 }
 
-fn lshr_(x: u64, k: u64, w: u32) -> u64 {
-    if k >= u64::from(w) {
+fn lshr_(x: u128, k: u128, w: u32) -> u128 {
+    if k >= u128::from(w) {
         0
     } else {
-        mask(x, w) >> k
+        mask128(x, w) >> k
     }
 }
 
-fn ashr_(x: u64, k: u64, w: u32) -> u64 {
-    let x = mask(x, w);
-    if k >= u64::from(w) {
+fn ashr_(x: u128, k: u128, w: u32) -> u128 {
+    let x = mask128(x, w);
+    if k >= u128::from(w) {
         if (x >> (w - 1)) & 1 == 1 {
-            mask(u64::MAX, w)
+            mask128(u128::MAX, w)
         } else {
             0
         }
     } else {
-        mask((signed(x, w) >> k) as u64, w)
+        mask128((signed(x, w) >> k) as u128, w)
     }
 }
 
-fn shr_(x: u64, k: u64, w: u32, arith: bool) -> u64 {
+pub(crate) fn shr_(x: u128, k: u128, w: u32, arith: bool) -> u128 {
     if arith {
         ashr_(x, k, w)
     } else {
@@ -975,60 +1038,61 @@ fn shr_(x: u64, k: u64, w: u32, arith: bool) -> u64 {
     }
 }
 
-fn rotl_(x: u64, k: u64, w: u32) -> u64 {
-    let x = mask(x, w);
-    let k = (k % u64::from(w)) as u32;
+fn rotl_(x: u128, k: u128, w: u32) -> u128 {
+    let x = mask128(x, w);
+    let k = (k % u128::from(w)) as u32;
     if k == 0 {
         x
     } else {
-        mask((x << k) | (x >> (w - k)), w)
+        mask128((x << k) | (x >> (w - k)), w)
     }
 }
 
-fn rotr_(x: u64, k: u64, w: u32) -> u64 {
-    let x = mask(x, w);
-    let k = (k % u64::from(w)) as u32;
+fn rotr_(x: u128, k: u128, w: u32) -> u128 {
+    let x = mask128(x, w);
+    let k = (k % u128::from(w)) as u32;
     if k == 0 {
         x
     } else {
-        mask((x >> k) | (x << (w - k)), w)
+        mask128((x >> k) | (x << (w - k)), w)
     }
 }
 
-fn rot_(x: u64, k: u64, w: u32, left: bool) -> u64 {
+pub(crate) fn rot_(x: u128, k: u128, w: u32, left: bool) -> u128 {
     if left { rotl_(x, k, w) } else { rotr_(x, k, w) }
 }
 
-fn udiv_(x: u64, y: u64, w: u32) -> u64 {
-    x.checked_div(y).unwrap_or_else(|| mask(u64::MAX, w))
+fn udiv_(x: u128, y: u128, w: u32) -> u128 {
+    x.checked_div(y).unwrap_or_else(|| mask128(u128::MAX, w))
 }
 
-fn urem_(x: u64, y: u64, _w: u32) -> u64 {
+fn urem_(x: u128, y: u128, _w: u32) -> u128 {
     x.checked_rem(y).unwrap_or(x)
 }
 
-fn sdiv_(x: u64, y: u64, w: u32) -> u64 {
+fn sdiv_(x: u128, y: u128, w: u32) -> u128 {
     let (a, b) = (signed(x, w), signed(y, w));
-    // `a` and `b` sit in [-2^63, 2^63-1], so `checked_div` is `None` exactly when the divisor is
-    // zero - the `MIN / -1` overflow cannot arise at these widths.
-    match a.checked_div(b) {
-        Some(q) => mask(q as u64, w),
-        None => {
-            if a >= 0 {
-                mask(u64::MAX, w)
-            } else {
-                1
-            }
-        }
+    // Division by zero is SMT-LIB's defined value, not a panic: all ones for a non-negative
+    // dividend, `1` otherwise. The one genuine `i128` overflow is `MIN / -1` at the full width;
+    // SMT-LIB wraps it back to `MIN`, which is what the width-masked cast does.
+    if b == 0 {
+        return if a >= 0 { mask128(u128::MAX, w) } else { 1 };
     }
+    if w == 128 && a == i128::MIN && b == -1 {
+        return mask128(a as u128, w);
+    }
+    mask128((a / b) as u128, w)
 }
 
-fn srem_(x: u64, y: u64, w: u32) -> u64 {
+fn srem_(x: u128, y: u128, w: u32) -> u128 {
     let (a, b) = (signed(x, w), signed(y, w));
-    match a.checked_rem(b) {
-        Some(r) => mask(r as u64, w),
-        None => mask(x, w),
+    if b == 0 {
+        return mask128(x, w);
     }
+    if w == 128 && a == i128::MIN && b == -1 {
+        return 0;
+    }
+    mask128((a % b) as u128, w)
 }
 
 impl fmt::Debug for Bv {
